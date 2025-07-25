@@ -1,8 +1,8 @@
 mod kmeans;
 
 use eframe::egui;
-use egui::{Align2, Color32};
-use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text};
+use egui::{Align2, Color32, TextureOptions, Vec2};
+use egui_plot::{Bar, BarChart, Line, Plot, PlotPoint, PlotPoints, Text};
 use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use reqwest::blocking;
@@ -136,6 +136,14 @@ struct MyApp {
     brighter_step: usize,
     batch_size: usize,
     max_iter: usize,
+    heatmap_data: VecDeque<Vec<f64>>,
+    heatmap_width: usize,
+    heatmap_height: usize,
+    update_counter: u32,
+    show_heatmap: bool,
+    show_liquidity_cost: bool,
+    execute_usd: f64,
+    max_liquidity_usd: f64,
 }
 
 impl MyApp {
@@ -171,6 +179,14 @@ impl MyApp {
             brighter_step: 5,
             batch_size: 1024,
             max_iter: 1024,
+            heatmap_data: VecDeque::new(),
+            heatmap_width: 480,
+            heatmap_height: 320,
+            update_counter: 0,
+            show_heatmap: true,
+            show_liquidity_cost: true,
+            execute_usd: 0.0,
+            max_liquidity_usd: 100000.0,
         }
     }
 
@@ -315,6 +331,200 @@ impl MyApp {
             self.update_buffer.clear();
             let _ = self.control_tx.try_send(Control::Refetch);
         }
+        self.update_counter += 1;
+        if self.update_counter.is_multiple_of(10) {
+            // Append every 10 updates to reduce frequency
+            self.append_to_heatmap();
+            self.update_counter = 0;
+        }
+    }
+
+    fn append_to_heatmap(&mut self) {
+        if self.bids.is_empty() || self.asks.is_empty() {
+            return;
+        }
+
+        let mut snapshot = vec![0.0; self.heatmap_height];
+
+        // Get max level sum for normalization
+        let max_qty = self
+            .bids
+            .values()
+            .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0))
+            .chain(
+                self.asks
+                    .values()
+                    .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0)),
+            )
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(1.0);
+
+        // Fill asks (top half)
+        let ask_iter = self.asks.iter().take(self.heatmap_height / 2).rev();
+        for (snapshot_cell, (_, qty_deq)) in snapshot
+            .iter_mut()
+            .take(self.heatmap_height / 2)
+            .zip(ask_iter)
+        {
+            let sum = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0) / max_qty;
+            *snapshot_cell = sum.clamp(0.0, 1.0);
+        }
+
+        // Fill bids (bottom half)
+        let bid_iter = self.bids.iter().rev().take(self.heatmap_height / 2);
+        for (snapshot_cell, (_, qty_deq)) in snapshot
+            .iter_mut()
+            .skip(self.heatmap_height / 2)
+            .zip(bid_iter)
+        {
+            let sum = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0) / max_qty;
+            *snapshot_cell = -sum.clamp(0.0, 1.0);
+        }
+
+        self.heatmap_data.push_back(snapshot);
+        if self.heatmap_data.len() > self.heatmap_width {
+            self.heatmap_data.pop_front();
+        }
+    }
+
+    fn calculate_liquidity_impact(&self) -> (f64, f64) {
+        if self.bids.is_empty() || self.asks.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        let best_bid = self
+            .bids
+            .keys()
+            .next_back()
+            .cloned()
+            .unwrap_or(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let best_ask = self
+            .asks
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let mid = (best_bid + best_ask) / 2.0;
+        if mid == 0.0 {
+            return (0.0, 0.0);
+        }
+
+        let quantity = self.execute_usd / mid;
+
+        // For buy impact (sweep asks)
+        let mut cum_qty = 0.0;
+        let mut weighted_price = 0.0;
+        let mut last_price = best_ask;
+        for (price, qty_deq) in self.asks.iter() {
+            last_price = price.to_f64().unwrap_or(0.0);
+            let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            let remaining = quantity - cum_qty;
+            if level_qty >= remaining {
+                weighted_price += remaining * last_price;
+                cum_qty += remaining;
+                break;
+            } else {
+                weighted_price += level_qty * last_price;
+                cum_qty += level_qty;
+            }
+        }
+        if cum_qty < quantity {
+            weighted_price += (quantity - cum_qty) * last_price;
+            cum_qty = quantity;
+        }
+        let buy_vwap = if cum_qty > 0.0 {
+            weighted_price / cum_qty
+        } else {
+            best_ask
+        };
+        let buy_impact = ((buy_vwap - mid) / mid * 10000.0).abs();
+
+        // For sell impact (sweep bids)
+        let mut cum_qty = 0.0;
+        let mut weighted_price = 0.0;
+        let mut last_price = best_bid;
+        for (price, qty_deq) in self.bids.iter().rev() {
+            last_price = price.to_f64().unwrap_or(0.0);
+            let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            let remaining = quantity - cum_qty;
+            if level_qty >= remaining {
+                weighted_price += remaining * last_price;
+                cum_qty += remaining;
+                break;
+            } else {
+                weighted_price += level_qty * last_price;
+                cum_qty += level_qty;
+            }
+        }
+        if cum_qty < quantity {
+            weighted_price += (quantity - cum_qty) * last_price;
+            cum_qty = quantity;
+        }
+        let sell_vwap = if cum_qty > 0.0 {
+            weighted_price / cum_qty
+        } else {
+            best_bid
+        };
+        let sell_impact = ((mid - sell_vwap) / mid * 10000.0).abs();
+
+        (buy_impact, sell_impact)
+    }
+
+    fn get_liquidity_curves(&self) -> (Vec<PlotPoint>, Vec<PlotPoint>) {
+        let best_bid = self
+            .bids
+            .keys()
+            .next_back()
+            .cloned()
+            .unwrap_or(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let best_ask = self
+            .asks
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let mid = (best_bid + best_ask) / 2.0;
+        if mid == 0.0 {
+            return (vec![], vec![]);
+        }
+
+        // Buy curve (sweep asks)
+        let mut buy_points = vec![PlotPoint::new(0.0, 0.0)];
+        let mut cum_qty = 0.0;
+        let mut weighted_price = 0.0;
+        for (price, qty_deq) in self.asks.iter() {
+            let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            weighted_price += level_qty * price.to_f64().unwrap_or(0.0);
+            cum_qty += level_qty;
+            let vwap = weighted_price / cum_qty;
+            let delta_p = ((vwap - mid) / mid * 10000.0).abs();
+            let usd = cum_qty * mid;
+            buy_points.push(PlotPoint::new(usd, delta_p));
+        }
+
+        // Sell curve (sweep bids)
+        let mut sell_points = vec![PlotPoint::new(0.0, 0.0)];
+        let mut cum_qty = 0.0;
+        let mut weighted_price = 0.0;
+        for (price, qty_deq) in self.bids.iter().rev() {
+            let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            weighted_price += level_qty * price.to_f64().unwrap_or(0.0);
+            cum_qty += level_qty;
+            let vwap = weighted_price / cum_qty;
+            let delta_p = ((mid - vwap) / mid * 10000.0).abs();
+            let usd = cum_qty * mid;
+            sell_points.push(PlotPoint::new(usd, delta_p));
+        }
+
+        (buy_points, sell_points)
     }
 }
 
@@ -364,6 +574,13 @@ impl eframe::App for MyApp {
             if ui.button("Toggle K-Means Mode").clicked() {
                 self.kmeans_mode = !self.kmeans_mode;
             }
+            if ui.button("Toggle Sweep / Liquidity-Cost").clicked() {
+                self.show_liquidity_cost = !self.show_liquidity_cost;
+            }
+            if ui.button("Toggle Depth-Time Heatmap").clicked() {
+                self.show_heatmap = !self.show_heatmap;
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Symbol:");
                 ui.text_edit_singleline(&mut self.edited_symbol);
@@ -381,6 +598,7 @@ impl eframe::App for MyApp {
                     self.asks.clear();
                     self.last_applied_u = 0;
                     self.is_synced = false;
+                    self.heatmap_data.clear();
                 }
             });
 
@@ -452,7 +670,7 @@ impl eframe::App for MyApp {
                         .bids
                         .iter()
                         .rev()
-                        .take(100)
+                        .take(200)
                         .map(|(key, deque)| {
                             let sum = deque.iter().cloned().sum::<Decimal>(); // Sum the VecDeque<Decimal>
                             (key, sum)
@@ -461,7 +679,7 @@ impl eframe::App for MyApp {
                     let ask_levels: Vec<(&Decimal, Decimal)> = self
                         .asks
                         .iter()
-                        .take(100)
+                        .take(200)
                         .map(|(key, deque)| {
                             let sum = deque.iter().cloned().sum::<Decimal>(); // Sum the VecDeque<Decimal>
                             (key, sum)
@@ -482,7 +700,7 @@ impl eframe::App for MyApp {
                         .bids
                         .values()
                         .rev()
-                        .take(100)
+                        .take(200)
                         .flat_map(|dq| dq.iter())
                         .cloned()
                         .max()
@@ -490,7 +708,7 @@ impl eframe::App for MyApp {
                     let max_ask_order: Decimal = self
                         .asks
                         .values()
-                        .take(100)
+                        .take(200)
                         .flat_map(|dq| dq.iter())
                         .cloned()
                         .max()
@@ -500,7 +718,7 @@ impl eframe::App for MyApp {
                             .bids
                             .values()
                             .rev()
-                            .take(100)
+                            .take(200)
                             .flat_map(|dq| dq.iter())
                             .cloned()
                             .collect();
@@ -511,7 +729,7 @@ impl eframe::App for MyApp {
                         let mut orders: Vec<_> = self
                             .asks
                             .values()
-                            .take(100)
+                            .take(200)
                             .flat_map(|dq| dq.iter())
                             .cloned()
                             .collect();
@@ -520,7 +738,7 @@ impl eframe::App for MyApp {
                     };
 
                     if !self.kmeans_mode {
-                        for (i, (_, qty_deq)) in self.asks.iter().take(100).enumerate() {
+                        for (i, (_, qty_deq)) in self.asks.iter().take(200).enumerate() {
                             let x = (i as f64 + 0.5) * step + 0.5;
                             let mut offset = 0.0;
 
@@ -549,7 +767,7 @@ impl eframe::App for MyApp {
                         }
 
                         // Color Mapping for Bids
-                        for (i, (_, qty_deq)) in self.bids.iter().rev().take(100).enumerate() {
+                        for (i, (_, qty_deq)) in self.bids.iter().rev().take(200).enumerate() {
                             let x = -(i as f64 + 0.5) * step - 0.5;
                             let mut offset = 0.0;
 
@@ -580,7 +798,7 @@ impl eframe::App for MyApp {
                         let asks_for_cluster: BTreeMap<Decimal, VecDeque<Decimal>> = self
                             .asks
                             .iter()
-                            .take(100)
+                            .take(200)
                             .map(|(&k, v)| (k, v.clone()))
                             .collect();
                         let mut kmeans_asks =
@@ -593,7 +811,7 @@ impl eframe::App for MyApp {
                             .bids
                             .iter()
                             .rev()
-                            .take(100)
+                            .take(200)
                             .map(|(&k, v)| (k, v.clone()))
                             .collect();
                         let mut kmeans_bids =
@@ -706,6 +924,117 @@ impl eframe::App for MyApp {
                         });
                 });
             });
+
+            if self.show_heatmap {
+                egui::Window::new("Depth-Time Heatmap")
+                    .open(&mut self.show_heatmap)
+                    .show(ctx, |ui| {
+                        if !self.heatmap_data.is_empty() {
+                            let width = self.heatmap_data.len();
+                            let height = self.heatmap_height;
+                            let mut pixels = vec![Color32::BLACK; width * height];
+
+                            for (col, snapshot) in self.heatmap_data.iter().enumerate() {
+                                for (row, &value) in snapshot.iter().enumerate() {
+                                    let normalized_value = value.abs() * 5.0;
+                                    let intensity = (normalized_value * 255.0) as u8;
+                                    let color = if value > 0.0 {
+                                        // Asks: black to yellow
+                                        Color32::from_rgb(intensity, intensity, 0)
+                                    } else if value < 0.0 {
+                                        // Bids: black to blue
+                                        Color32::from_rgb(0, 0, intensity)
+                                    } else {
+                                        Color32::BLACK
+                                    };
+                                    pixels[row * width + col] = color;
+                                }
+                            }
+
+                            let color_image = egui::ColorImage {
+                                size: [width, height],
+                                source_size: Default::default(),
+                                pixels,
+                            };
+
+                            let texture = ui.ctx().load_texture(
+                                "heatmap",
+                                color_image,
+                                TextureOptions::LINEAR,
+                            );
+
+                            ui.image(&texture);
+                        } else {
+                            ui.label("No heatmap data yet.");
+                        }
+                    });
+            }
+
+            if self.show_liquidity_cost {
+                egui::Window::new("Sweep / Liquidity-Cost")
+                    .default_size(Vec2::new(480.0, 320.0))
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        let (buy_points, sell_points) = self.get_liquidity_curves();
+                        let buy_plot_points: PlotPoints =
+                            PlotPoints::from_iter(buy_points.clone().iter().map(|p| [p.x, p.y]));
+                        let buy_line = Line::new("a", buy_plot_points).color(Color32::BLUE);
+                        let sell_plot_points: PlotPoints =
+                            PlotPoints::from_iter(sell_points.clone().iter().map(|p| [p.x, p.y]));
+                        let sell_line = Line::new("b", sell_plot_points).color(Color32::RED);
+
+                        // Calculate min/max for x and y axes from both curves
+                        let all_points = buy_points.iter().chain(sell_points.iter());
+                        let x_min = all_points
+                            .clone()
+                            .map(|p| p.x)
+                            .fold(f64::INFINITY, f64::min);
+                        let x_max = all_points
+                            .clone()
+                            .map(|p| p.x)
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let y_min = all_points
+                            .clone()
+                            .map(|p| p.y)
+                            .fold(f64::INFINITY, f64::min);
+                        let y_max = all_points
+                            .clone()
+                            .map(|p| p.y)
+                            .fold(f64::NEG_INFINITY, f64::max);
+
+                        // Optional: Add padding to avoid clipping (adjust 0.05 for more/less density)
+                        let x_range = x_max - x_min;
+                        let y_range = y_max - y_min;
+                        let padded_x_min = x_min - 0.05 * x_range;
+                        let padded_x_max = x_max + 0.05 * x_range;
+                        let padded_y_min = y_min - 0.05 * y_range;
+                        let padded_y_max = y_max + 0.05 * y_range;
+
+                        ui.allocate_ui(egui::Vec2::new(480.0, 320.0), |ui| {
+                            Plot::new("liquidity_cost_plot")
+                                .show_axes([true, true])
+                                .default_x_bounds(padded_x_min, padded_x_max) // Set x-axis bounds
+                                .default_y_bounds(padded_y_min, padded_y_max) // Set y-axis bounds (makes it denser)
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(buy_line);
+                                    plot_ui.line(sell_line);
+                                });
+                        });
+
+                        let (buy_impact, sell_impact) = self.calculate_liquidity_impact();
+                        ui.label(format!(
+                            "Buy impact = {buy_impact:.2} bps | Sell impact = {sell_impact:.2} bps"
+                        ));
+
+                        ui.horizontal(|ui| {
+                            ui.label("Execute USD X:");
+                            ui.add(egui::Slider::new(
+                                &mut self.execute_usd,
+                                0.0..=self.max_liquidity_usd,
+                            ));
+                        });
+                    });
+            }
         });
     }
 }
