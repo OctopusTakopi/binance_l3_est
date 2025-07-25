@@ -144,6 +144,7 @@ struct MyApp {
     show_liquidity_cost: bool,
     execute_usd: f64,
     max_liquidity_usd: f64,
+    rolling_max_qty: f64,
 }
 
 impl MyApp {
@@ -187,6 +188,7 @@ impl MyApp {
             show_liquidity_cost: true,
             execute_usd: 0.0,
             max_liquidity_usd: 100000.0,
+            rolling_max_qty: 1.0,
         }
     }
 
@@ -347,17 +349,17 @@ impl MyApp {
         let mut snapshot = vec![0.0; self.heatmap_height];
 
         // Get max level sum for normalization
-        let max_qty = self
+        let current_max = self
             .bids
             .values()
+            .chain(self.asks.values())
             .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0))
-            .chain(
-                self.asks
-                    .values()
-                    .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0)),
-            )
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(1.0);
+            .fold(0.0, f64::max);
+
+        // Smooth update (EMA)
+        let a = 0.3;
+        self.rolling_max_qty = self.rolling_max_qty * (1.0 - a) + current_max * a;
+        let max_qty = self.rolling_max_qty.max(1e-6) / 3.0;
 
         // Fill asks (top half)
         let ask_iter = self.asks.iter().take(self.heatmap_height / 2).rev();
@@ -936,16 +938,16 @@ impl eframe::App for MyApp {
 
                             for (col, snapshot) in self.heatmap_data.iter().enumerate() {
                                 for (row, &value) in snapshot.iter().enumerate() {
-                                    let normalized_value = value.abs() * 5.0;
+                                    let normalized_value = value.abs() * 10.0;
                                     let intensity = (normalized_value * 255.0) as u8;
-                                    let color = if value > 0.0 {
-                                        // Asks: black to yellow
-                                        Color32::from_rgb(intensity, intensity, 0)
-                                    } else if value < 0.0 {
-                                        // Bids: black to blue
-                                        Color32::from_rgb(0, 0, intensity)
+                                    let color = if value >= 0.0 {
+                                        // Ask: red intensity
+                                        let intensity = (value * 255.0).clamp(0.0, 255.0) as u8;
+                                        Color32::from_rgb(intensity, 0, 0)
                                     } else {
-                                        Color32::BLACK
+                                        // Bid: blue intensity
+                                        let intensity = (-value * 255.0).clamp(0.0, 255.0) as u8;
+                                        Color32::from_rgb(0, 0, intensity)
                                     };
                                     pixels[row * width + col] = color;
                                 }
