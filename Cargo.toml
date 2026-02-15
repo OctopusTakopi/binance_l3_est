@@ -1,6 +1,6 @@
 [package]
 name = "binance_l3_est"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["OctopusTakopi"]
 repository = "https://github.com/OctopusTakopi/binance_l3_est"
