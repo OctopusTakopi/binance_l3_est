@@ -28,3 +28,4 @@ rust_decimal = { version = "1.37.2", features = ["macros"] }
 egui_plot = "0.33.0"
 rand = "0.9.1"
 once_cell = "1.21.3"
+rust_decimal_macros = "1.40.0"

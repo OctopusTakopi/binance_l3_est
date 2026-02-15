@@ -1,13 +1,14 @@
 mod kmeans;
 
 use eframe::egui;
-use egui::{Align2, Color32, TextureOptions, Vec2};
+use egui::{Align2, Color32, TextureOptions, Vec2, Vec2b};
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoint, PlotPoints, Text};
 use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use reqwest::blocking;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
+use rust_decimal_macros::dec;
 use serde::Deserialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
@@ -47,25 +48,76 @@ struct OrderBookSnapshot {
 
 #[allow(dead_code)]
 #[derive(Deserialize, Clone)]
-struct DepthUpdate {
-    e: String,
+pub struct Trade {
+    #[serde(rename = "e")]
+    pub event_type: String,
     #[serde(rename = "E")]
-    event_time: u64,
+    pub event_time: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "t")]
+    pub trade_id: u64,
+    #[serde(rename = "p")]
+    pub price: Decimal,
+    #[serde(rename = "q")]
+    pub quantity: Decimal,
+    #[serde(rename = "X")]
+    pub order_type: String,
     #[serde(rename = "T")]
-    transaction_time: u64,
-    s: String,
+    pub transaction_time: u64,
+    #[serde(rename = "m")]
+    pub is_buyer_maker: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Clone)]
+pub struct DepthUpdate {
+    #[serde(rename = "e")]
+    pub event_type: String,
+    #[serde(rename = "E")]
+    pub event_time: u64,
+    #[serde(rename = "T")]
+    pub transaction_time: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
     #[serde(rename = "U")]
-    capital_u: u64,
+    pub capital_u: u64,
     #[serde(rename = "u")]
-    small_u: u64,
-    pu: i64,
-    b: Vec<Vec<Decimal>>,
-    a: Vec<Vec<Decimal>>,
+    pub small_u: u64,
+    #[serde(rename = "pu")]
+    pub pu: i64,
+    #[serde(rename = "b")]
+    pub b: Vec<Vec<Decimal>>,
+    #[serde(rename = "a")]
+    pub a: Vec<Vec<Decimal>>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Clone)]
+pub struct BookTicker {
+    #[serde(rename = "u")]
+    pub update_id: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "b")]
+    pub best_bid_price: Decimal,
+    #[serde(rename = "B")]
+    pub best_bid_qty: Decimal,
+    #[serde(rename = "a")]
+    pub best_ask_price: Decimal,
+    #[serde(rename = "A")]
+    pub best_ask_qty: Decimal,
+    #[serde(rename = "T")]
+    pub transaction_time: u64,
+    #[serde(rename = "E")]
+    pub event_time: u64,
 }
 
 enum AppMessage {
     Snapshot(OrderBookSnapshot),
     Update(DepthUpdate),
+    Trade(Trade),
+    Ticker(BookTicker),
 }
 
 enum Control {
@@ -142,9 +194,49 @@ struct MyApp {
     update_counter: u32,
     show_heatmap: bool,
     show_liquidity_cost: bool,
+    show_metrics: bool,
     execute_usd: f64,
     max_liquidity_usd: f64,
-    rolling_max_qty: f64,
+    rolling_mean_qty: f64,
+    rolling_std_qty: f64,
+    warmup_samples: usize,
+    // SOFP: Rolling Trade Stats
+    rolling_trade_mean: f64,
+    rolling_trade_std: f64,
+    // CTR: Metrics
+    fills_bid_top1: f64,
+    cancels_bid_top1: f64,
+    fills_ask_top1: f64,
+    cancels_ask_top1: f64,
+    fills_bid_top20: f64,
+    cancels_bid_top20: f64,
+    fills_ask_top20: f64,
+    cancels_ask_top20: f64,
+    // OTR: Metrics
+    inflows_bid_top1: f64,
+    inflows_ask_top1: f64,
+    inflows_bid_top20: f64,
+    inflows_ask_top20: f64,
+
+    ctr_history_bid_top1: VecDeque<PlotPoint>,
+    ctr_history_ask_top1: VecDeque<PlotPoint>,
+    ctr_history_both_top1: VecDeque<PlotPoint>,
+
+    ctr_history_bid_top20: VecDeque<PlotPoint>,
+    ctr_history_ask_top20: VecDeque<PlotPoint>,
+    ctr_history_both_top20: VecDeque<PlotPoint>,
+
+    otr_history_bid_top1: VecDeque<PlotPoint>,
+    otr_history_ask_top1: VecDeque<PlotPoint>,
+    otr_history_both_top1: VecDeque<PlotPoint>,
+
+    otr_history_bid_top20: VecDeque<PlotPoint>,
+    otr_history_ask_top20: VecDeque<PlotPoint>,
+    otr_history_both_top20: VecDeque<PlotPoint>,
+
+    metrics_timer: u64,
+    trade_buffer: std::collections::HashMap<Decimal, VecDeque<(Decimal, u64)>>,
+    heatmap_contrast: f64,
 }
 
 impl MyApp {
@@ -186,9 +278,41 @@ impl MyApp {
             update_counter: 0,
             show_heatmap: true,
             show_liquidity_cost: true,
-            execute_usd: 0.0,
+            show_metrics: true,
+            execute_usd: 100000.0,
             max_liquidity_usd: 100000.0,
-            rolling_max_qty: 1.0,
+            rolling_mean_qty: 0.0,
+            rolling_std_qty: 1.0,
+            warmup_samples: 0,
+            rolling_trade_mean: 0.0,
+            rolling_trade_std: 1.0,
+            fills_bid_top1: 0.0,
+            cancels_bid_top1: 0.0,
+            fills_ask_top1: 0.0,
+            cancels_ask_top1: 0.0,
+            fills_bid_top20: 0.0,
+            cancels_bid_top20: 0.0,
+            fills_ask_top20: 0.0,
+            cancels_ask_top20: 0.0,
+            inflows_bid_top1: 0.0,
+            inflows_ask_top1: 0.0,
+            inflows_bid_top20: 0.0,
+            inflows_ask_top20: 0.0,
+            ctr_history_bid_top1: VecDeque::with_capacity(2000),
+            ctr_history_ask_top1: VecDeque::with_capacity(2000),
+            ctr_history_both_top1: VecDeque::with_capacity(2000),
+            ctr_history_bid_top20: VecDeque::with_capacity(2000),
+            ctr_history_ask_top20: VecDeque::with_capacity(2000),
+            ctr_history_both_top20: VecDeque::with_capacity(2000),
+            otr_history_bid_top1: VecDeque::with_capacity(2000),
+            otr_history_ask_top1: VecDeque::with_capacity(2000),
+            otr_history_both_top1: VecDeque::with_capacity(2000),
+            otr_history_bid_top20: VecDeque::with_capacity(2000),
+            otr_history_ask_top20: VecDeque::with_capacity(2000),
+            otr_history_both_top20: VecDeque::with_capacity(2000),
+            metrics_timer: 0,
+            trade_buffer: std::collections::HashMap::new(),
+            heatmap_contrast: 4.0,
         }
     }
 
@@ -225,7 +349,10 @@ impl MyApp {
         mut symbol: String,
     ) {
         loop {
-            let ws_url_str = format!("wss://fstream.binance.com/ws/{symbol}@depth@0ms");
+            // Use combined streams: depth and aggTrade
+            let ws_url_str = format!(
+                "wss://fstream.binance.com/stream?streams={symbol}@depth@0ms/{symbol}@trade/{symbol}@bookTicker"
+            );
             let (mut ws_stream, response) = match connect_async(ws_url_str).await {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -238,16 +365,45 @@ impl MyApp {
             let tx_clone = tx.clone();
             let ctx_clone = ctx.clone();
             let ws_handle = tokio::spawn(async move {
+                #[derive(Deserialize)]
+                struct CombinedStream {
+                    stream: String,
+                    data: serde_json::Value,
+                }
+
                 while let Some(result) = ws_stream.next().await {
                     match result {
                         Ok(message) => match message {
                             WsMessage::Text(text) => {
-                                match serde_json::from_str::<DepthUpdate>(&text) {
-                                    Ok(update) => {
-                                        tx_clone.send(AppMessage::Update(update)).unwrap();
-                                        ctx_clone.request_repaint();
+                                if let Ok(combined) = serde_json::from_str::<CombinedStream>(&text)
+                                {
+                                    if combined.stream.ends_with("@depth@0ms") {
+                                        if let Ok(update) =
+                                            serde_json::from_value::<DepthUpdate>(combined.data)
+                                        {
+                                            let _ = tx_clone.send(AppMessage::Update(update));
+                                            ctx_clone.request_repaint();
+                                        }
+                                    } else if combined.stream.ends_with("@trade") {
+                                        if let Ok(trade) =
+                                            serde_json::from_value::<Trade>(combined.data)
+                                        {
+                                            // Filter out Binance placeholder messages (X: "NA")
+                                            if trade.order_type != "NA"
+                                                && trade.price > Decimal::ZERO
+                                            {
+                                                let _ = tx_clone.send(AppMessage::Trade(trade));
+                                                ctx_clone.request_repaint();
+                                            }
+                                        }
+                                    } else if combined.stream.ends_with("@bookTicker") {
+                                        if let Ok(ticker) =
+                                            serde_json::from_value::<BookTicker>(combined.data)
+                                        {
+                                            let _ = tx_clone.send(AppMessage::Ticker(ticker));
+                                            ctx_clone.request_repaint();
+                                        }
                                     }
-                                    Err(e) => println!("Update JSON error: {e:?}"),
                                 }
                             }
                             WsMessage::Ping(payload) => {
@@ -336,30 +492,66 @@ impl MyApp {
         self.update_counter += 1;
         if self.update_counter.is_multiple_of(10) {
             // Append every 10 updates to reduce frequency
+            if self.warmup_samples < 200 && self.update_counter % 10 == 0 {
+                self.update_rolling_stats();
+            }
+
             self.append_to_heatmap();
             self.update_counter = 0;
         }
     }
 
-    fn append_to_heatmap(&mut self) {
+    fn update_rolling_stats(&mut self) {
         if self.bids.is_empty() || self.asks.is_empty() {
             return;
         }
 
-        let mut snapshot = vec![0.0; self.heatmap_height];
-
-        // Get max level sum for normalization
-        let current_max = self
+        // Collect all level quantities currently in the book
+        let levels: Vec<f64> = self
             .bids
             .values()
             .chain(self.asks.values())
             .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0))
-            .fold(0.0, f64::max);
+            .filter(|&q| q > 0.0)
+            .collect();
 
-        // Smooth update (EMA)
-        let a = 0.3;
-        self.rolling_max_qty = self.rolling_max_qty * (1.0 - a) + current_max * a;
-        let max_qty = self.rolling_max_qty.max(1e-6) / 3.0;
+        if !levels.is_empty() {
+            let m = levels.iter().sum::<f64>() / levels.len() as f64;
+            let v = levels.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / levels.len() as f64;
+            let s = v.sqrt().max(1e-9);
+
+            // Update rolling stats (very slow EMA for high stability)
+            // Faster alpha during warmup (0.05) vs stable (0.01)
+            let alpha = if self.warmup_samples < 200 {
+                0.05
+            } else {
+                0.01
+            };
+
+            if self.rolling_mean_qty == 0.0 {
+                self.rolling_mean_qty = m;
+                self.rolling_std_qty = s;
+            } else {
+                self.rolling_mean_qty = self.rolling_mean_qty * (1.0 - alpha) + m * alpha;
+                self.rolling_std_qty = self.rolling_std_qty * (1.0 - alpha) + s * alpha;
+            }
+            self.warmup_samples += 1;
+        }
+    }
+
+    fn append_to_heatmap(&mut self) {
+        // ALWAYS update stats first
+        self.update_rolling_stats();
+
+        // ONLY draw to heatmap if we have passed the warmup threshold
+        // This ensures the first frame is already correctly scaled
+        if self.warmup_samples < 200 {
+            return;
+        }
+
+        let mut snapshot = vec![0.0; self.heatmap_height];
+        let mean = self.rolling_mean_qty;
+        let std = self.rolling_std_qty.max(1e-9);
 
         // Fill asks (top half)
         let ask_iter = self.asks.iter().take(self.heatmap_height / 2).rev();
@@ -368,8 +560,12 @@ impl MyApp {
             .take(self.heatmap_height / 2)
             .zip(ask_iter)
         {
-            let sum = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0) / max_qty;
-            *snapshot_cell = sum.clamp(0.0, 1.0);
+            let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            if qty > 0.0 {
+                // Z-Score Standardization with Offset
+                let z = (qty - mean) / std;
+                *snapshot_cell = z + 10.0;
+            }
         }
 
         // Fill bids (bottom half)
@@ -379,8 +575,11 @@ impl MyApp {
             .skip(self.heatmap_height / 2)
             .zip(bid_iter)
         {
-            let sum = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0) / max_qty;
-            *snapshot_cell = -sum.clamp(0.0, 1.0);
+            let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            if qty > 0.0 {
+                let z = (qty - mean) / std;
+                *snapshot_cell = -(z + 10.0); // Negative to distinguish bids
+            }
         }
 
         self.heatmap_data.push_back(snapshot);
@@ -532,6 +731,204 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // SOFP & CTR: Periodically sample metrics (every 100ms approximation)
+        self.metrics_timer += 1;
+        if self.metrics_timer % 10 == 0 {
+            let now = ctx.input(|i| i.time);
+
+            // Top 1 Split CTR
+            let ctr_bid_1 = if self.fills_bid_top1 > 0.0 {
+                self.cancels_bid_top1 / self.fills_bid_top1
+            } else {
+                0.0
+            };
+            let ctr_ask_1 = if self.fills_ask_top1 > 0.0 {
+                self.cancels_ask_top1 / self.fills_ask_top1
+            } else {
+                0.0
+            };
+            let total_fills_1 = self.fills_bid_top1 + self.fills_ask_top1;
+            let total_cancels_1 = self.cancels_bid_top1 + self.cancels_ask_top1;
+            let ctr_both_1 = if total_fills_1 > 0.0 {
+                total_cancels_1 / total_fills_1
+            } else {
+                0.0
+            };
+
+            self.ctr_history_bid_top1
+                .push_back(PlotPoint::new(now, ctr_bid_1));
+            self.ctr_history_ask_top1
+                .push_back(PlotPoint::new(now, ctr_ask_1));
+            self.ctr_history_both_top1
+                .push_back(PlotPoint::new(now, ctr_both_1));
+
+            // Top 20 Split CTR
+            let ctr_bid_20 = if self.fills_bid_top20 > 0.0 {
+                self.cancels_bid_top20 / self.fills_bid_top20
+            } else {
+                0.0
+            };
+            let ctr_ask_20 = if self.fills_ask_top20 > 0.0 {
+                self.cancels_ask_top20 / self.fills_ask_top20
+            } else {
+                0.0
+            };
+            let total_fills_20 = self.fills_bid_top20 + self.fills_ask_top20;
+            let total_cancels_20 = self.cancels_bid_top20 + self.cancels_ask_top20;
+            let ctr_both_20 = if total_fills_20 > 0.0 {
+                total_cancels_20 / total_fills_20
+            } else {
+                0.0
+            };
+
+            self.ctr_history_bid_top20
+                .push_back(PlotPoint::new(now, ctr_bid_20));
+            self.ctr_history_ask_top20
+                .push_back(PlotPoint::new(now, ctr_ask_20));
+            self.ctr_history_both_top20
+                .push_back(PlotPoint::new(now, ctr_both_20));
+
+            // Prune history (200s limit)
+            let limit = now - 200.0;
+            while self
+                .ctr_history_bid_top1
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.ctr_history_bid_top1.pop_front();
+            }
+            while self
+                .ctr_history_ask_top1
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.ctr_history_ask_top1.pop_front();
+            }
+            while self
+                .ctr_history_both_top1
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.ctr_history_both_top1.pop_front();
+            }
+
+            while self
+                .ctr_history_bid_top20
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.ctr_history_bid_top20.pop_front();
+            }
+            while self
+                .ctr_history_ask_top20
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.ctr_history_ask_top20.pop_front();
+            }
+            while self
+                .ctr_history_both_top20
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.ctr_history_both_top20.pop_front();
+            }
+
+            // OTR History Pruning
+            while self
+                .otr_history_bid_top1
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.otr_history_bid_top1.pop_front();
+            }
+            while self
+                .otr_history_ask_top1
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.otr_history_ask_top1.pop_front();
+            }
+            while self
+                .otr_history_both_top1
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.otr_history_both_top1.pop_front();
+            }
+            while self
+                .otr_history_bid_top20
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.otr_history_bid_top20.pop_front();
+            }
+            while self
+                .otr_history_ask_top20
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.otr_history_ask_top20.pop_front();
+            }
+            while self
+                .otr_history_both_top20
+                .front()
+                .map_or(false, |p| p.x < limit)
+            {
+                self.otr_history_both_top20.pop_front();
+            }
+
+            // OTR Calculation (Top-1)
+            let otr_bid_1 = if self.fills_bid_top1 > 0.0 {
+                self.inflows_bid_top1 / self.fills_bid_top1
+            } else {
+                0.0
+            };
+            let otr_ask_1 = if self.fills_ask_top1 > 0.0 {
+                self.inflows_ask_top1 / self.fills_ask_top1
+            } else {
+                0.0
+            };
+            let otr_both_1 = if (self.fills_bid_top1 + self.fills_ask_top1) > 0.0 {
+                (self.inflows_bid_top1 + self.inflows_ask_top1)
+                    / (self.fills_bid_top1 + self.fills_ask_top1)
+            } else {
+                0.0
+            };
+
+            self.otr_history_bid_top1
+                .push_back(PlotPoint::new(now, otr_bid_1));
+            self.otr_history_ask_top1
+                .push_back(PlotPoint::new(now, otr_ask_1));
+            self.otr_history_both_top1
+                .push_back(PlotPoint::new(now, otr_both_1));
+
+            // OTR Calculation (Top-20)
+            let otr_bid_20 = if self.fills_bid_top20 > 0.0 {
+                self.inflows_bid_top20 / self.fills_bid_top20
+            } else {
+                0.0
+            };
+            let otr_ask_20 = if self.fills_ask_top20 > 0.0 {
+                self.inflows_ask_top20 / self.fills_ask_top20
+            } else {
+                0.0
+            };
+            let otr_both_20 = if (self.fills_bid_top20 + self.fills_ask_top20) > 0.0 {
+                (self.inflows_bid_top20 + self.inflows_ask_top20)
+                    / (self.fills_bid_top20 + self.fills_ask_top20)
+            } else {
+                0.0
+            };
+
+            self.otr_history_bid_top20
+                .push_back(PlotPoint::new(now, otr_bid_20));
+            self.otr_history_ask_top20
+                .push_back(PlotPoint::new(now, otr_ask_20));
+            self.otr_history_both_top20
+                .push_back(PlotPoint::new(now, otr_both_20));
+        }
+
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::Snapshot(snap) => {
@@ -565,6 +962,71 @@ impl eframe::App for MyApp {
                         self.process_update(update);
                     }
                 }
+                AppMessage::Trade(trade) => {
+                    // SOFP: Update rolling trade size distribution (very fast alpha for regime detection)
+                    let qty = trade.quantity.to_f64().unwrap_or(0.0);
+                    if qty > 0.0 {
+                        let alpha = 0.1; // Fast adaptation
+                        if self.rolling_trade_mean == 0.0 {
+                            self.rolling_trade_mean = qty;
+                            self.rolling_trade_std = qty * 0.1;
+                        } else {
+                            let diff = qty - self.rolling_trade_mean;
+                            self.rolling_trade_mean += alpha * diff;
+                            self.rolling_trade_std =
+                                (1.0 - alpha) * self.rolling_trade_std + alpha * diff.abs();
+                        }
+                    }
+
+                    // CTR: Track fills
+                    let price = trade.price;
+
+                    let best_bid = self
+                        .bids
+                        .keys()
+                        .next_back()
+                        .cloned()
+                        .unwrap_or(Decimal::ZERO);
+                    let best_ask = self.asks.keys().next().cloned().unwrap_or(Decimal::ZERO);
+
+                    if trade.is_buyer_maker {
+                        // Sell Trade (Hits Bid)
+                        if price == best_bid {
+                            self.fills_bid_top1 += qty;
+                        }
+                        if self.bids.keys().rev().take(20).any(|&p| p == price) {
+                            self.fills_bid_top20 += qty;
+                        }
+                    } else {
+                        // Buy Trade (Lifts Ask)
+                        if price == best_ask {
+                            self.fills_ask_top1 += qty;
+                        }
+                        if self.asks.keys().take(20).any(|&p| p == price) {
+                            self.fills_ask_top20 += qty;
+                        }
+                    }
+
+                    self.trade_buffer
+                        .entry(trade.price)
+                        .or_default()
+                        .push_back((trade.quantity, trade.transaction_time));
+
+                    // Cleanup old trades (older than 10s)
+                    let now = trade.transaction_time;
+                    for deq in self.trade_buffer.values_mut() {
+                        while let Some(front) = deq.front() {
+                            if now > front.1 + 10_000 {
+                                deq.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                AppMessage::Ticker(ticker) => {
+                    self.apply_ticker_anchor(ticker);
+                }
             }
         }
 
@@ -581,6 +1043,9 @@ impl eframe::App for MyApp {
             }
             if ui.button("Toggle Depth-Time Heatmap").clicked() {
                 self.show_heatmap = !self.show_heatmap;
+            }
+            if ui.button("Toggle Microstructure Metrics").clicked() {
+                self.show_metrics = !self.show_metrics;
             }
 
             ui.horizontal(|ui| {
@@ -601,6 +1066,37 @@ impl eframe::App for MyApp {
                     self.last_applied_u = 0;
                     self.is_synced = false;
                     self.heatmap_data.clear();
+                    self.rolling_mean_qty = 0.0;
+                    self.rolling_std_qty = 1.0;
+                    self.warmup_samples = 0;
+                    self.rolling_trade_mean = 0.0;
+                    self.rolling_trade_std = 1.0;
+                    self.fills_bid_top1 = 0.0;
+                    self.cancels_bid_top1 = 0.0;
+                    self.fills_ask_top1 = 0.0;
+                    self.cancels_ask_top1 = 0.0;
+                    self.fills_bid_top20 = 0.0;
+                    self.cancels_bid_top20 = 0.0;
+                    self.fills_ask_top20 = 0.0;
+                    self.cancels_ask_top20 = 0.0;
+                    self.inflows_bid_top1 = 0.0;
+                    self.inflows_ask_top1 = 0.0;
+                    self.inflows_bid_top20 = 0.0;
+                    self.inflows_ask_top20 = 0.0;
+
+                    self.ctr_history_bid_top1.clear();
+                    self.ctr_history_ask_top1.clear();
+                    self.ctr_history_both_top1.clear();
+                    self.ctr_history_bid_top20.clear();
+                    self.ctr_history_ask_top20.clear();
+                    self.ctr_history_both_top20.clear();
+                    self.otr_history_bid_top1.clear();
+                    self.otr_history_ask_top1.clear();
+                    self.otr_history_both_top1.clear();
+                    self.otr_history_bid_top20.clear();
+                    self.otr_history_ask_top20.clear();
+                    self.otr_history_both_top20.clear();
+                    self.update_counter = 0;
                 }
             });
 
@@ -615,8 +1111,14 @@ impl eframe::App for MyApp {
                 });
             } else {
                 ui.horizontal(|ui| {
-                    ui.label("Age mode brighter step %:");
-                    ui.add(egui::Slider::new(&mut self.brighter_step, 1..=10));
+                    ui.label("Heatmap Contrast (Z-Range):");
+                    ui.add(egui::Slider::new(&mut self.heatmap_contrast, 1.0..=10.0));
+                    if ui.button("Reset Stats").clicked() {
+                        self.rolling_mean_qty = 0.0;
+                        self.rolling_std_qty = 1.0;
+                        self.warmup_samples = 0;
+                        self.heatmap_data.clear();
+                    }
                 });
             }
 
@@ -927,50 +1429,237 @@ impl eframe::App for MyApp {
                 });
             });
 
-            if self.show_heatmap {
-                egui::Window::new("Depth-Time Heatmap")
-                    .open(&mut self.show_heatmap)
-                    .show(ctx, |ui| {
-                        if !self.heatmap_data.is_empty() {
-                            let width = self.heatmap_data.len();
-                            let height = self.heatmap_height;
-                            let mut pixels = vec![Color32::BLACK; width * height];
+            // if self.show_heatmap {
+            egui::Window::new("Microstructure Metrics")
+                .open(&mut self.show_metrics)
+                .show(ctx, |ui| {
+                    ui.label("Cancellation-to-Trade Ratio (CTR)");
+                    ui.label("CTR > 1.0: Spoofing/Layering > Fills");
 
-                            for (col, snapshot) in self.heatmap_data.iter().enumerate() {
-                                for (row, &value) in snapshot.iter().enumerate() {
-                                    let normalized_value = value.abs() * 10.0;
-                                    let intensity = (normalized_value * 255.0) as u8;
-                                    let color = if value >= 0.0 {
-                                        // Ask: red intensity
-                                        let intensity = (value * 255.0).clamp(0.0, 255.0) as u8;
-                                        Color32::from_rgb(intensity, 0, 0)
-                                    } else {
-                                        // Bid: blue intensity
-                                        let intensity = (-value * 255.0).clamp(0.0, 255.0) as u8;
-                                        Color32::from_rgb(0, 0, intensity)
-                                    };
-                                    pixels[row * width + col] = color;
-                                }
-                            }
-
-                            let color_image = egui::ColorImage {
-                                size: [width, height],
-                                source_size: Default::default(),
-                                pixels,
-                            };
-
-                            let texture = ui.ctx().load_texture(
-                                "heatmap",
-                                color_image,
-                                TextureOptions::LINEAR,
-                            );
-
-                            ui.image(&texture);
-                        } else {
-                            ui.label("No heatmap data yet.");
-                        }
+                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                        Plot::new("top1_plot")
+                            .link_axis("ctr_group", Vec2b::new(true, false))
+                            .show_axes([true, true])
+                            .y_axis_label("Top-1 Ratio")
+                            .legend(egui_plot::Legend::default())
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new(
+                                        "Bid",
+                                        PlotPoints::from_iter(
+                                            self.ctr_history_bid_top1.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::GREEN),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Ask",
+                                        PlotPoints::from_iter(
+                                            self.ctr_history_ask_top1.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::RED),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Both",
+                                        PlotPoints::from_iter(
+                                            self.ctr_history_both_top1.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::WHITE),
+                                );
+                            });
                     });
-            }
+
+                    ui.add_space(4.0);
+
+                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                        Plot::new("top20_plot")
+                            .link_axis("ctr_group", Vec2b::new(true, false))
+                            .show_axes([true, true])
+                            .y_axis_label("Top-20 Ratio")
+                            .legend(egui_plot::Legend::default())
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new(
+                                        "Bid",
+                                        PlotPoints::from_iter(
+                                            self.ctr_history_bid_top20.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::GREEN),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Ask",
+                                        PlotPoints::from_iter(
+                                            self.ctr_history_ask_top20.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::RED),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Both",
+                                        PlotPoints::from_iter(
+                                            self.ctr_history_both_top20.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::WHITE),
+                                );
+                            });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("Order-to-Trade Ratio (OTR)");
+                    ui.label("OTR > 1.0: Liquidity Adding > Taking (Reloading)");
+
+                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                        Plot::new("otr_top1_plot")
+                            .link_axis("otr_group", Vec2b::new(true, false))
+                            .show_axes([true, true])
+                            .y_axis_label("Top-1 OTR")
+                            .legend(egui_plot::Legend::default())
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new(
+                                        "Bid",
+                                        PlotPoints::from_iter(
+                                            self.otr_history_bid_top1.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::GREEN),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Ask",
+                                        PlotPoints::from_iter(
+                                            self.otr_history_ask_top1.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::RED),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Both",
+                                        PlotPoints::from_iter(
+                                            self.otr_history_both_top1.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::WHITE),
+                                );
+                            });
+                    });
+
+                    ui.add_space(4.0);
+
+                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                        Plot::new("otr_top20_plot")
+                            .link_axis("otr_group", Vec2b::new(true, false))
+                            .show_axes([true, true])
+                            .y_axis_label("Top-20 OTR")
+                            .legend(egui_plot::Legend::default())
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new(
+                                        "Bid",
+                                        PlotPoints::from_iter(
+                                            self.otr_history_bid_top20.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::GREEN),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Ask",
+                                        PlotPoints::from_iter(
+                                            self.otr_history_ask_top20.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::RED),
+                                );
+                                plot_ui.line(
+                                    Line::new(
+                                        "Both",
+                                        PlotPoints::from_iter(
+                                            self.otr_history_both_top20.iter().map(|p| [p.x, p.y]),
+                                        ),
+                                    )
+                                    .color(Color32::WHITE),
+                                );
+                            });
+                    });
+                });
+
+            egui::Window::new("Depth-Time Heatmap")
+                .open(&mut self.show_heatmap)
+                .show(ctx, |ui| {
+                    if !self.heatmap_data.is_empty() {
+                        let width = self.heatmap_data.len();
+                        let height = self.heatmap_height;
+                        let mut pixels = vec![Color32::BLACK; width * height];
+
+                        for (col, snapshot) in self.heatmap_data.iter().enumerate() {
+                            for (row, &value) in snapshot.iter().enumerate() {
+                                let abs_val = value.abs();
+
+                                // 1. Recover Z-score
+                                let z = if value != 0.0 { abs_val - 10.0 } else { -999.0 };
+
+                                // 2. Strict Black Background for empty/low liquidity
+                                if z < -1.0 {
+                                    // Threshold: 1 std deviation below mean is BLACK
+                                    pixels[row * width + col] = Color32::BLACK;
+                                    continue;
+                                }
+
+                                // 3. Mapping Z [-1, 3] -> [0, 1]
+                                // Range = heatmap_contrast (default 4.0)
+                                let t = ((z + 1.0) / self.heatmap_contrast).clamp(0.0, 1.0);
+
+                                // 4. Gamma Correction (Square) to push mid-tones down (more contrast)
+                                let t_sq = t * t;
+                                let intensity = (t_sq * 255.0) as u8;
+
+                                let color = if value > 0.0 {
+                                    // ASKS: Fire (Red -> Orange -> Yellow)
+                                    // R: Primary
+                                    // G: Secondary (starts at t>0.5)
+                                    let g_boost = ((t_sq - 0.5).max(0.0) * 2.0 * 255.0) as u8;
+                                    Color32::from_rgb(intensity, g_boost, 0)
+                                } else {
+                                    // BIDS: Ice (Blue -> Cyan -> White-ish)
+                                    // B: Primary
+                                    // G: Secondary (starts at t>0.3)
+                                    let g_boost = ((t_sq - 0.3).max(0.0) * 1.5 * 255.0)
+                                        .clamp(0.0, 255.0)
+                                        as u8;
+                                    Color32::from_rgb(0, g_boost, intensity)
+                                };
+
+                                pixels[row * width + col] = color;
+                            }
+                        }
+
+                        let color_image = egui::ColorImage {
+                            size: [width, height],
+                            source_size: Default::default(),
+                            pixels,
+                        };
+
+                        let texture =
+                            ui.ctx()
+                                .load_texture("heatmap", color_image, TextureOptions::LINEAR);
+
+                        ui.image(&texture);
+                    } else {
+                        ui.label("No heatmap data yet.");
+                    }
+                });
+            // }
 
             if self.show_liquidity_cost {
                 egui::Window::new("Sweep / Liquidity-Cost")
@@ -985,38 +1674,14 @@ impl eframe::App for MyApp {
                             PlotPoints::from_iter(sell_points.clone().iter().map(|p| [p.x, p.y]));
                         let sell_line = Line::new("b", sell_plot_points).color(Color32::RED);
 
-                        // Calculate min/max for x and y axes from both curves
-                        let all_points = buy_points.iter().chain(sell_points.iter());
-                        let x_min = all_points
-                            .clone()
-                            .map(|p| p.x)
-                            .fold(f64::INFINITY, f64::min);
-                        let x_max = all_points
-                            .clone()
-                            .map(|p| p.x)
-                            .fold(f64::NEG_INFINITY, f64::max);
-                        let y_min = all_points
-                            .clone()
-                            .map(|p| p.y)
-                            .fold(f64::INFINITY, f64::min);
-                        let y_max = all_points
-                            .clone()
-                            .map(|p| p.y)
-                            .fold(f64::NEG_INFINITY, f64::max);
-
-                        // Optional: Add padding to avoid clipping (adjust 0.05 for more/less density)
-                        let x_range = x_max - x_min;
-                        let y_range = y_max - y_min;
-                        let padded_x_min = x_min - 0.05 * x_range;
-                        let padded_x_max = x_max + 0.05 * x_range;
-                        let padded_y_min = y_min - 0.05 * y_range;
-                        let padded_y_max = y_max + 0.05 * y_range;
-
+                        // Sweep / Liquidity-Cost Visualization
                         ui.allocate_ui(egui::Vec2::new(480.0, 320.0), |ui| {
                             Plot::new("liquidity_cost_plot")
                                 .show_axes([true, true])
-                                .default_x_bounds(padded_x_min, padded_x_max) // Set x-axis bounds
-                                .default_y_bounds(padded_y_min, padded_y_max) // Set y-axis bounds (makes it denser)
+                                .x_axis_label("Sweep Size (USD)")
+                                .y_axis_label("Price Impact (bps)")
+                                .boxed_zoom_pointer_button(egui::PointerButton::Secondary)
+                                .auto_bounds(egui::Vec2b::new(true, true)) // Allow egui to manage initial fit
                                 .show(ui, |plot_ui| {
                                     plot_ui.line(buy_line);
                                     plot_ui.line(sell_line);
@@ -1056,70 +1721,274 @@ impl MyApp {
 
 impl MyApp {
     fn apply_update(&mut self, update: &DepthUpdate) {
+        // Process Bids
         for bid in &update.b {
             let price = bid[0];
             let qty = bid[1];
             if qty == Decimal::ZERO {
                 self.bids.remove(&price);
             } else {
-                let price = bid[0];
-                let qty = bid[1];
-                if qty > Decimal::ZERO {
-                    if let Some(old_qty) = self.bids.get_mut(&price) {
-                        let old_sum = old_qty.iter().sum::<Decimal>();
-                        if old_sum > qty {
-                            let change = old_sum - qty;
-                            if let Some(pos) = old_qty.iter().rposition(|&x| x == change) {
-                                old_qty.remove(pos); // Removes the last occurrence of the value
-                            } else {
-                                let largest_order = *old_qty.iter().max().unwrap();
-                                let largest_pos =
-                                    old_qty.iter().position(|&x| x == largest_order).unwrap();
-                                old_qty.remove(largest_pos);
-                                old_qty.push_back(largest_order - change);
-                            }
-                        } else if old_sum < qty {
-                            if old_sum < qty {
-                                let change = qty - old_sum;
-                                old_qty.push_back(change);
-                            }
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        self.bids.insert(price, VecDeque::from(vec![qty]));
-                    }
-                }
+                self.process_level_change(&price, qty, true, update.transaction_time);
             }
         }
+        // Process Asks
         for ask in &update.a {
             let price = ask[0];
             let qty = ask[1];
             if qty == Decimal::ZERO {
                 self.asks.remove(&price);
-            } else if let Some(old_qty) = self.asks.get_mut(&price) {
-                let old_sum = old_qty.iter().sum::<Decimal>();
-                if old_sum > qty {
-                    let change = old_sum - qty;
-                    if let Some(pos) = old_qty.iter().rposition(|&x| x == change) {
-                        old_qty.remove(pos); // Removes the last occurrence of the value
-                    } else {
-                        let largest_order = *old_qty.iter().max().unwrap();
-                        let largest_pos = old_qty.iter().position(|&x| x == largest_order).unwrap();
-                        old_qty.remove(largest_pos);
-                        old_qty.push_back(largest_order - change);
+            } else {
+                self.process_level_change(&price, qty, false, update.transaction_time);
+            }
+        }
+        self.last_applied_u = update.small_u;
+    }
+
+    fn apply_ticker_anchor(&mut self, ticker: BookTicker) {
+        // 0. Safety Pruning: Ensure no crossed book remains from stale depth updates
+        // Remove Bids > Ticker.BestBid
+        while let Some(&high_bid) = self.bids.keys().next_back() {
+            if high_bid > ticker.best_bid_price {
+                self.bids.pop_last();
+            } else {
+                break;
+            }
+        }
+        // Remove Asks < Ticker.BestAsk
+        while let Some(&low_ask) = self.asks.keys().next() {
+            if low_ask < ticker.best_ask_price {
+                self.asks.pop_first();
+            } else {
+                break;
+            }
+        }
+
+        // 1. Sync Bids (Level 1)
+        if let Some(&best_bid_price) = self.bids.keys().next_back() {
+            if best_bid_price == ticker.best_bid_price {
+                if let Some(queue) = self.bids.get_mut(&best_bid_price) {
+                    let est_total: Decimal = queue.iter().sum();
+                    let ticker_qty = ticker.best_bid_qty;
+
+                    if ticker_qty < est_total {
+                        // PRUNE: oldest orders first (FIFO)
+                        let mut to_remove = est_total - ticker_qty;
+                        while to_remove > Decimal::ZERO && !queue.is_empty() {
+                            if queue[0] <= to_remove {
+                                to_remove -= queue[0];
+                                queue.pop_front();
+                            } else {
+                                queue[0] -= to_remove;
+                                to_remove = Decimal::ZERO;
+                            }
+                        }
+                    } else if ticker_qty > est_total {
+                        // FILL: Inferred inflow
+                        queue.push_back(ticker_qty - est_total);
                     }
-                } else if old_sum < qty {
-                    if old_sum < qty {
-                        let change = qty - old_sum;
-                        old_qty.push_back(change);
+                }
+            } else if ticker.best_bid_price > best_bid_price {
+                // New high bid price detected by ticker before depth update
+                self.bids.insert(
+                    ticker.best_bid_price,
+                    VecDeque::from(vec![ticker.best_bid_qty]),
+                );
+            }
+        }
+
+        // 2. Sync Asks (Level 1)
+        if let Some(&best_ask_price) = self.asks.keys().next() {
+            if best_ask_price == ticker.best_ask_price {
+                if let Some(queue) = self.asks.get_mut(&best_ask_price) {
+                    let est_total: Decimal = queue.iter().sum();
+                    let ticker_qty = ticker.best_ask_qty;
+
+                    if ticker_qty < est_total {
+                        // PRUNE: oldest orders first (FIFO)
+                        let mut to_remove = est_total - ticker_qty;
+                        while to_remove > Decimal::ZERO && !queue.is_empty() {
+                            if queue[0] <= to_remove {
+                                to_remove -= queue[0];
+                                queue.pop_front();
+                            } else {
+                                queue[0] -= to_remove;
+                                to_remove = Decimal::ZERO;
+                            }
+                        }
+                    } else if ticker_qty > est_total {
+                        // FILL: Inferred inflow
+                        queue.push_back(ticker_qty - est_total);
+                    }
+                }
+            } else if ticker.best_ask_price < best_ask_price {
+                // New low ask price detected by ticker before depth update
+                self.asks.insert(
+                    ticker.best_ask_price,
+                    VecDeque::from(vec![ticker.best_ask_qty]),
+                );
+            }
+        }
+    }
+
+    fn process_level_change(
+        &mut self,
+        price: &Decimal,
+        new_total_qty: Decimal,
+        is_bid: bool,
+        ts: u64,
+    ) {
+        // 1. Determine status first to avoid borrow conflicts later
+        let is_tob = if is_bid {
+            self.bids.keys().next_back() == Some(price)
+        } else {
+            self.asks.keys().next() == Some(price)
+        };
+
+        let in_top20 = if is_bid {
+            self.bids.keys().rev().take(20).any(|p| p == price)
+        } else {
+            self.asks.keys().take(20).any(|p| p == price)
+        };
+
+        // 2. Now perform mutable work
+        let side = if is_bid {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
+
+        if let Some(queue) = side.get_mut(price) {
+            let old_total: Decimal = queue.iter().sum();
+
+            if new_total_qty > old_total {
+                // INFLOW: Liquidity added
+                let diff = new_total_qty - old_total;
+
+                // OTR Tracking
+                let diff_f = diff.to_f64().unwrap_or(0.0);
+                if is_bid {
+                    if is_tob {
+                        self.inflows_bid_top1 += diff_f;
+                        self.inflows_bid_top20 += diff_f;
+                    } else if in_top20 {
+                        self.inflows_bid_top20 += diff_f;
                     }
                 } else {
-                    continue;
+                    if is_tob {
+                        self.inflows_ask_top1 += diff_f;
+                        self.inflows_ask_top20 += diff_f;
+                    } else if in_top20 {
+                        self.inflows_ask_top20 += diff_f;
+                    }
                 }
-            } else {
-                self.asks.insert(price, VecDeque::from(vec![qty]));
+
+                if !is_tob && diff > dec!(0.1) {
+                    // Statistical Order Flow Profiling (SOFP)
+                    // Instead of static 60/40, we use the rolling trade distribution
+                    let avg_trade = self.rolling_trade_mean.max(0.001);
+                    let diff_f = diff.to_f64().unwrap_or(0.0);
+
+                    if diff_f > avg_trade * 2.0 {
+                        // Fragment based on market regime (avg trade size)
+                        let num_fragments = (diff_f / avg_trade).min(5.0).max(2.0) as usize;
+                        let fragment_val = (diff / Decimal::from(num_fragments)).round_dp(8);
+                        let mut remaining = diff;
+                        for i in 0..num_fragments {
+                            if i == num_fragments - 1 {
+                                queue.push_back(remaining);
+                            } else {
+                                queue.push_back(fragment_val);
+                                remaining -= fragment_val;
+                            }
+                        }
+                    } else {
+                        queue.push_back(diff);
+                    }
+                } else {
+                    queue.push_back(diff);
+                }
+            } else if new_total_qty < old_total {
+                // OUTFLOW: Liquidity reduced
+                let mut remaining_to_remove = old_total - new_total_qty;
+
+                // 3. MTQR (Marker-Triggered Queue Refining)
+                if let Some(trade_deq) = self.trade_buffer.get_mut(price) {
+                    while let Some(trade) = trade_deq.front() {
+                        if ts >= trade.1 && ts - trade.1 < 1000 {
+                            let trade_qty = trade.0;
+
+                            // GROUND TRUTH SNAP:
+                            // If an atomic trade hit the front of the queue,
+                            // we know that the maker's size was AT LEAST the trade size.
+                            if !queue.is_empty() && queue[0] < trade_qty {
+                                // Our estimation was too small - snap to reality
+                                queue[0] = trade_qty;
+                            }
+
+                            let consumed = remaining_to_remove.min(trade_qty);
+                            let mut inner_remaining = consumed;
+
+                            while inner_remaining > Decimal::ZERO && !queue.is_empty() {
+                                if queue[0] <= inner_remaining {
+                                    inner_remaining -= queue[0];
+                                    queue.pop_front();
+                                } else {
+                                    queue[0] -= inner_remaining;
+                                    inner_remaining = Decimal::ZERO;
+                                }
+                            }
+
+                            remaining_to_remove -= consumed;
+                            trade_deq.pop_front();
+                            if remaining_to_remove == Decimal::ZERO {
+                                break;
+                            }
+                        } else if trade.1 > ts {
+                            break;
+                        } else {
+                            trade_deq.pop_front();
+                        }
+                    }
+                }
+
+                if remaining_to_remove > Decimal::ZERO {
+                    // CTR: This remaining amount is a cancellation
+                    let rem_f = remaining_to_remove.to_f64().unwrap_or(0.0);
+
+                    if is_bid {
+                        if is_tob {
+                            self.cancels_bid_top1 += rem_f;
+                            self.cancels_bid_top20 += rem_f;
+                        } else if in_top20 {
+                            self.cancels_bid_top20 += rem_f;
+                        }
+                    } else {
+                        if is_tob {
+                            self.cancels_ask_top1 += rem_f;
+                            self.cancels_ask_top20 += rem_f;
+                        } else if in_top20 {
+                            self.cancels_ask_top20 += rem_f;
+                        }
+                    }
+
+                    // 4. Cancellation/Modification (LIFO with Priority Reset)
+                    if let Some(pos) = queue.iter().rposition(|&x| x == remaining_to_remove) {
+                        queue.remove(pos);
+                    } else {
+                        let res = queue.iter().enumerate().max_by(|a, b| a.1.cmp(b.1));
+
+                        if let Some((max_pos, &max_val)) = res {
+                            queue.remove(max_pos);
+                            let remainder = max_val - remaining_to_remove;
+                            if remainder > Decimal::ZERO {
+                                queue.push_back(remainder);
+                            }
+                        }
+                    }
+                }
             }
+        } else {
+            side.insert(*price, VecDeque::from(vec![new_total_qty]));
         }
     }
 }
