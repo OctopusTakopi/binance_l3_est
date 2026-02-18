@@ -1,43 +1,57 @@
 # BINANCE PERP L3 Order Book Estimator
 
-![Demo GIF](demo.gif)
+![Demo GIF](demo2.gif)
 
-This project is a real-time visualization tool for the Binance perpetual swap order book. The tool uses L2 data's change in time to naively estimate a L3 order book microstructure. we can change to more complex model to estimate the L3 book later.
+This project is a high-performance real-time visualization tool for the Binance perpetual swap order book. It leverages **Execution-Aware Queue Dynamics (EAQD)** to estimate a Level 3 (L3) order book microstructure from Level 2 (L2) events and real-time trade streams, providing deep insights into order queue seniority and market participant behavior.
 
-## Features
+## Key Features
 
-* **Real-time Data**: Streams order book data using Binance's WebSocket API.
-* **Bid/Ask Visualization**: Displays the current bids and asks for the binance perpetual swap.
-* **Order Queue Estimation**: Estimates the order queue at each price level using L2 data.
-* **Dynamic Bar Coloring**: Bid and ask bars are dynamically colored based on the age of the order.
-* **K-Means Cluster**: Auto classification for different market participants
+*   **Real-time Data Architecture**: Low-latency streaming of order book depth and trade events via Binance WebSocket API.
+*   **Advanced L3 Estimation**: Moves beyond naive estimation to account for execution priority, cancellation behavior, and market regime.
+*   **Microstructure Metrics Panel**: Dedicated real-time dashboard for high-resolution microstructure health indicators.
+    *   **Order-to-Trade Ratio (OTR)**: Tracks liquidity provision intensity at Top-1 and Top-20 levels.
+    *   **Cancellation-to-Trade Ratio (CTR)**: Monitors cancellation/spoofing velocity across sides.
+*   **Dynamic Heatmap Visualization**: Standardized depth heatmap using Z-score normalization with interactive controls.
+*   **Interactive Analytics**: Sweep/Liquidity-Cost windows with right-click drag-to-zoom and multi-axis rendering.
+*   **K-Means Clustering**: Real-time classification of market participants based on order size and arrival patterns.
+
+## Technical Core
+
+The estimator utilizes several proprietary techniques to maintain a ground-truth-aligned L3 view:
+
+### 1. Execution-Aware Queue Dynamics (EAQD)
+Refined logic for inflow and outflow handling. Unlike static models, EAQD understands the difference between fills (FIFO consumption) and cancellations (LIFO/Priority-based reduction).
+
+### 2. Deep Depth Fragmentation (DWF)
+Also known as Statistical Order Flow Profiling (SOFP). This system fragments large L2 liquidity additions into multiple virtual orders based on a rolling distribution of market trade sizes, preventing the "giant single order" bias in naive estimators.
+
+### 3. Marker-Triggered Queue Refining (MTQR)
+Integrates the `@trade` stream as a synchronization pulse. When a trade occurs at a specific price, MTQR validates the maker's size against our estimated queue. If a trade exceeds our front-of-queue estimate, the model "snaps" to the ground truth and adjusts seniority accordingly.
+
+### 4. Seniority Decay & Priority Reset
+Handles partial fills and order modifications. Partial fills retain their queue position, while modifications that increase size or change price trigger a priority reset, accurately reflecting exchange matching engine logic.
 
 ## Usage
 
 #### From Source
 
-To try out the project, ensure you have Rust installed. You can install it from [https://www.rust-lang.org](https://www.rust-lang.org).
+Ensure you have Rust installed ([rust-lang.org](https://www.rust-lang.org)).
 
 1. Clone the repository:
+   ```bash
+   git clone https://github.com/OctopusTakopi/binance_l3_est.git
+   cd binance_l3_est
+   ```
 
-```bash
-git clone https://github.com/OctopusTakopi/binance_l3_est.git
-cd binance_l3_est
-```
+2. Run the project:
+   ```bash
+   cargo run -r
+   ```
 
-2. Run the project with a trading pair of your choice:
-
-```bash
-cargo run -r
-```
-
-#### From Release Binary
-
-Visit the [Releases page](https://github.com/OctopusTakopi/binance_l3_est/releases) and download the latest binary release.
-
-The chart dynamically updates as new WebSocket messages are received, and the bars for bids and asks are color-coded based on the order age, in K-means mode it based on the order size.
-
-> **Note:** Allow enough time for the estimator to start working as it processes the historical L2 data.
+#### UI Controls
+*   **Microstructure Toggle**: Use the UI panel to enable/disable the OTR/CTR dashboard.
+*   **Heatmap Z-Score**: Adjust the standardization slider to highlight liquidity outliers.
+*   **Zoom**: Right-click and drag on the liquidity charts to inspect specific price ranges.
 
 ## License
 
