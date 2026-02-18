@@ -733,7 +733,7 @@ impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // SOFP & CTR: Periodically sample metrics (every 100ms approximation)
         self.metrics_timer += 1;
-        if self.metrics_timer % 10 == 0 {
+        if self.metrics_timer % 10 == 0 && self.warmup_samples > 200 {
             let now = ctx.input(|i| i.time);
 
             // Top 1 Split CTR
@@ -951,6 +951,39 @@ impl eframe::App for MyApp {
                     self.last_applied_u = snap.last_update_id;
                     self.is_synced = false;
 
+                    // Reset Rolling Stats & Metrics on new snapshot (connection start)
+                    self.warmup_samples = 0;
+                    self.rolling_mean_qty = 0.0;
+                    self.rolling_std_qty = 1.0;
+                    self.rolling_trade_mean = 0.0;
+                    self.rolling_trade_std = 1.0;
+
+                    self.fills_bid_top1 = 0.0;
+                    self.cancels_bid_top1 = 0.0;
+                    self.fills_ask_top1 = 0.0;
+                    self.cancels_ask_top1 = 0.0;
+                    self.fills_bid_top20 = 0.0;
+                    self.cancels_bid_top20 = 0.0;
+                    self.fills_ask_top20 = 0.0;
+                    self.cancels_ask_top20 = 0.0;
+                    self.inflows_bid_top1 = 0.0;
+                    self.inflows_ask_top1 = 0.0;
+                    self.inflows_bid_top20 = 0.0;
+                    self.inflows_ask_top20 = 0.0;
+
+                    self.ctr_history_bid_top1.clear();
+                    self.ctr_history_ask_top1.clear();
+                    self.ctr_history_both_top1.clear();
+                    self.ctr_history_bid_top20.clear();
+                    self.ctr_history_ask_top20.clear();
+                    self.ctr_history_both_top20.clear();
+                    self.otr_history_bid_top1.clear();
+                    self.otr_history_ask_top1.clear();
+                    self.otr_history_both_top1.clear();
+                    self.otr_history_bid_top20.clear();
+                    self.otr_history_ask_top20.clear();
+                    self.otr_history_both_top20.clear();
+
                     while let Some(update) = self.update_buffer.pop_front() {
                         self.process_update(update);
                     }
@@ -1066,11 +1099,13 @@ impl eframe::App for MyApp {
                     self.last_applied_u = 0;
                     self.is_synced = false;
                     self.heatmap_data.clear();
+                    // Full Reset
+                    self.warmup_samples = 0;
                     self.rolling_mean_qty = 0.0;
                     self.rolling_std_qty = 1.0;
-                    self.warmup_samples = 0;
                     self.rolling_trade_mean = 0.0;
                     self.rolling_trade_std = 1.0;
+
                     self.fills_bid_top1 = 0.0;
                     self.cancels_bid_top1 = 0.0;
                     self.fills_ask_top1 = 0.0;
@@ -1436,168 +1471,214 @@ impl eframe::App for MyApp {
                     ui.label("Cancellation-to-Trade Ratio (CTR)");
                     ui.label("CTR > 1.0: Spoofing/Layering > Fills");
 
-                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
-                        Plot::new("top1_plot")
-                            .link_axis("ctr_group", Vec2b::new(true, false))
-                            .show_axes([true, true])
-                            .y_axis_label("Top-1 Ratio")
-                            .legend(egui_plot::Legend::default())
-                            .show(ui, |plot_ui| {
-                                plot_ui.line(
-                                    Line::new(
-                                        "Bid",
-                                        PlotPoints::from_iter(
-                                            self.ctr_history_bid_top1.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::GREEN),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Ask",
-                                        PlotPoints::from_iter(
-                                            self.ctr_history_ask_top1.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::RED),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Both",
-                                        PlotPoints::from_iter(
-                                            self.ctr_history_both_top1.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::WHITE),
-                                );
-                            });
-                    });
+                    if self.warmup_samples < 200 {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(50.0);
+                            ui.heading("Warming up metrics...");
+                            ui.label(format!(
+                                "Collecting data: {:.0}%",
+                                (self.warmup_samples as f64 / 200.0) * 100.0
+                            ));
+                            ui.add_space(50.0);
+                        });
+                    } else {
+                        ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                            Plot::new("top1_plot")
+                                .link_axis("ctr_group", Vec2b::new(true, false))
+                                .show_axes([true, true])
+                                .y_axis_label("Top-1 Ratio")
+                                .legend(egui_plot::Legend::default())
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Bid",
+                                            PlotPoints::from_iter(
+                                                self.ctr_history_bid_top1
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::GREEN),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Ask",
+                                            PlotPoints::from_iter(
+                                                self.ctr_history_ask_top1
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::RED),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Both",
+                                            PlotPoints::from_iter(
+                                                self.ctr_history_both_top1
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::WHITE),
+                                    );
+                                });
+                        });
 
-                    ui.add_space(4.0);
+                        ui.add_space(4.0);
 
-                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
-                        Plot::new("top20_plot")
-                            .link_axis("ctr_group", Vec2b::new(true, false))
-                            .show_axes([true, true])
-                            .y_axis_label("Top-20 Ratio")
-                            .legend(egui_plot::Legend::default())
-                            .show(ui, |plot_ui| {
-                                plot_ui.line(
-                                    Line::new(
-                                        "Bid",
-                                        PlotPoints::from_iter(
-                                            self.ctr_history_bid_top20.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::GREEN),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Ask",
-                                        PlotPoints::from_iter(
-                                            self.ctr_history_ask_top20.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::RED),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Both",
-                                        PlotPoints::from_iter(
-                                            self.ctr_history_both_top20.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::WHITE),
-                                );
-                            });
-                    });
+                        ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                            Plot::new("top20_plot")
+                                .link_axis("ctr_group", Vec2b::new(true, false))
+                                .show_axes([true, true])
+                                .y_axis_label("Top-20 Ratio")
+                                .legend(egui_plot::Legend::default())
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Bid",
+                                            PlotPoints::from_iter(
+                                                self.ctr_history_bid_top20
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::GREEN),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Ask",
+                                            PlotPoints::from_iter(
+                                                self.ctr_history_ask_top20
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::RED),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Both",
+                                            PlotPoints::from_iter(
+                                                self.ctr_history_both_top20
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::WHITE),
+                                    );
+                                });
+                        });
 
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label("Order-to-Trade Ratio (OTR)");
-                    ui.label("OTR > 1.0: Liquidity Adding > Taking (Reloading)");
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label("Order-to-Trade Ratio (OTR)");
+                        ui.label("OTR > 1.0: Liquidity Adding > Taking (Reloading)");
 
-                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
-                        Plot::new("otr_top1_plot")
-                            .link_axis("otr_group", Vec2b::new(true, false))
-                            .show_axes([true, true])
-                            .y_axis_label("Top-1 OTR")
-                            .legend(egui_plot::Legend::default())
-                            .show(ui, |plot_ui| {
-                                plot_ui.line(
-                                    Line::new(
-                                        "Bid",
-                                        PlotPoints::from_iter(
-                                            self.otr_history_bid_top1.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::GREEN),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Ask",
-                                        PlotPoints::from_iter(
-                                            self.otr_history_ask_top1.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::RED),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Both",
-                                        PlotPoints::from_iter(
-                                            self.otr_history_both_top1.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::WHITE),
-                                );
-                            });
-                    });
+                        ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                            Plot::new("otr_top1_plot")
+                                .link_axis("otr_group", Vec2b::new(true, false))
+                                .show_axes([true, true])
+                                .y_axis_label("Top-1 OTR")
+                                .legend(egui_plot::Legend::default())
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Bid",
+                                            PlotPoints::from_iter(
+                                                self.otr_history_bid_top1
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::GREEN),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Ask",
+                                            PlotPoints::from_iter(
+                                                self.otr_history_ask_top1
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::RED),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Both",
+                                            PlotPoints::from_iter(
+                                                self.otr_history_both_top1
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::WHITE),
+                                    );
+                                });
+                        });
 
-                    ui.add_space(4.0);
+                        ui.add_space(4.0);
 
-                    ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
-                        Plot::new("otr_top20_plot")
-                            .link_axis("otr_group", Vec2b::new(true, false))
-                            .show_axes([true, true])
-                            .y_axis_label("Top-20 OTR")
-                            .legend(egui_plot::Legend::default())
-                            .show(ui, |plot_ui| {
-                                plot_ui.line(
-                                    Line::new(
-                                        "Bid",
-                                        PlotPoints::from_iter(
-                                            self.otr_history_bid_top20.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::GREEN),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Ask",
-                                        PlotPoints::from_iter(
-                                            self.otr_history_ask_top20.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::RED),
-                                );
-                                plot_ui.line(
-                                    Line::new(
-                                        "Both",
-                                        PlotPoints::from_iter(
-                                            self.otr_history_both_top20.iter().map(|p| [p.x, p.y]),
-                                        ),
-                                    )
-                                    .color(Color32::WHITE),
-                                );
-                            });
-                    });
+                        ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
+                            Plot::new("otr_top20_plot")
+                                .link_axis("otr_group", Vec2b::new(true, false))
+                                .show_axes([true, true])
+                                .y_axis_label("Top-20 OTR")
+                                .legend(egui_plot::Legend::default())
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Bid",
+                                            PlotPoints::from_iter(
+                                                self.otr_history_bid_top20
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::GREEN),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Ask",
+                                            PlotPoints::from_iter(
+                                                self.otr_history_ask_top20
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::RED),
+                                    );
+                                    plot_ui.line(
+                                        Line::new(
+                                            "Both",
+                                            PlotPoints::from_iter(
+                                                self.otr_history_both_top20
+                                                    .iter()
+                                                    .map(|p| [p.x, p.y]),
+                                            ),
+                                        )
+                                        .color(Color32::WHITE),
+                                    );
+                                });
+                        });
+                    }
                 });
 
             egui::Window::new("Depth-Time Heatmap")
                 .open(&mut self.show_heatmap)
                 .show(ctx, |ui| {
-                    if !self.heatmap_data.is_empty() {
+                    if self.warmup_samples < 200 {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(50.0);
+                            ui.heading("Warming up heatmap...");
+                            ui.label(format!(
+                                "Collecting data: {:.0}%",
+                                (self.warmup_samples as f64 / 200.0) * 100.0
+                            ));
+                            ui.add_space(50.0);
+                        });
+                    } else if !self.heatmap_data.is_empty() {
                         let width = self.heatmap_data.len();
                         let height = self.heatmap_height;
                         let mut pixels = vec![Color32::BLACK; width * height];
