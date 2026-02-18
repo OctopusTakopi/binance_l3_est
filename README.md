@@ -23,7 +23,9 @@ The estimator utilizes several proprietary techniques to maintain a ground-truth
 Refined logic for inflow and outflow handling. Unlike static models, EAQD understands the difference between fills (FIFO consumption) and cancellations (LIFO/Priority-based reduction).
 
 ### 2. Deep Depth Fragmentation (DWF)
-Also known as Statistical Order Flow Profiling (SOFP). This system fragments large L2 liquidity additions into multiple virtual orders based on a rolling distribution of market trade sizes, preventing the "giant single order" bias in naive estimators.
+Also known as Statistical Order Flow Profiling (SOFP). This system fragments large L2 liquidity additions into multiple virtual orders based on a rolling distribution of market trade sizes.
+*   **Whale Bypass**: If an addition is extremely large (e.g., > 20x average trade size), the system bypasses fragmentation, treating it as a single high-conviction "Whale" order.
+*   **Robust Multi-Order Cancellation**: Combined with EAQD, the system now handles large LIFO cancellations that span multiple fragments, ensuring accurate queue reduction even when fragmented blocks are removed.
 
 ### 3. Marker-Triggered Queue Refining (MTQR)
 Integrates the `@trade` stream as a synchronization pulse. When a trade occurs at a specific price, MTQR validates the maker's size against our estimated queue. If a trade exceeds our front-of-queue estimate, the model "snaps" to the ground truth and adjusts seniority accordingly.

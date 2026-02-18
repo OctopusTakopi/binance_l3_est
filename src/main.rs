@@ -1888,7 +1888,10 @@ impl MyApp {
                     let avg_trade = self.rolling_trade_mean.max(0.001);
                     let diff_f = diff.to_f64().unwrap_or(0.0);
 
-                    if diff_f > avg_trade * 2.0 {
+                    // FRAGMENTATION HEURISTIC:
+                    // Only fragment if the addition is significantly larger than typical trades,
+                    // BUT NOT so large that it's likely a single 'Whale' order (bypass if > 20x avg).
+                    if diff_f > avg_trade * 2.0 && diff_f < avg_trade * 20.0 {
                         // Fragment based on market regime (avg trade size)
                         let num_fragments = (diff_f / avg_trade).min(5.0).max(2.0) as usize;
                         let fragment_val = (diff / Decimal::from(num_fragments)).round_dp(8);
@@ -1972,16 +1975,19 @@ impl MyApp {
                     }
 
                     // 4. Cancellation/Modification (LIFO with Priority Reset)
+                    // Updated to handle multi-order removals (robust LIFO)
                     if let Some(pos) = queue.iter().rposition(|&x| x == remaining_to_remove) {
                         queue.remove(pos);
                     } else {
-                        let res = queue.iter().enumerate().max_by(|a, b| a.1.cmp(b.1));
-
-                        if let Some((max_pos, &max_val)) = res {
-                            queue.remove(max_pos);
-                            let remainder = max_val - remaining_to_remove;
-                            if remainder > Decimal::ZERO {
-                                queue.push_back(remainder);
+                        // Iteratively remove from back (LIFO) until remaining_to_remove is exhausted
+                        while remaining_to_remove > Decimal::ZERO && !queue.is_empty() {
+                            let last_idx = queue.len() - 1;
+                            if queue[last_idx] <= remaining_to_remove {
+                                remaining_to_remove -= queue[last_idx];
+                                queue.pop_back();
+                            } else {
+                                queue[last_idx] -= remaining_to_remove;
+                                remaining_to_remove = Decimal::ZERO;
                             }
                         }
                     }
