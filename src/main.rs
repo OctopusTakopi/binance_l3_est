@@ -4,11 +4,13 @@ use eframe::egui;
 use egui::{Align2, Color32, TextureOptions, Vec2, Vec2b};
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoint, PlotPoints, Text};
 use futures_util::{SinkExt, StreamExt};
+use num_complex::Complex;
 use once_cell::sync::Lazy;
 use reqwest::blocking;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
+use rustfft::FftPlanner;
 use serde::Deserialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
@@ -237,6 +239,29 @@ struct MyApp {
     metrics_timer: u64,
     trade_buffer: std::collections::HashMap<Decimal, VecDeque<(Decimal, u64)>>,
     heatmap_contrast: f64,
+    // TWAP Detector (FFT)
+    show_twap: bool,
+    twap_bin_ms: u64,
+    twap_window_bins: usize,
+    twap_threshold_sigma: f64,
+    twap_current_bin_start: u64,
+    // Split buy / sell bin counters (shared clock, separate counts)
+    twap_current_bin_buy: u64,
+    twap_current_bin_sell: u64,
+    twap_current_vol_buy: f64,
+    twap_current_vol_sell: f64,
+    twap_bins_buy: VecDeque<f64>,
+    twap_bins_sell: VecDeque<f64>,
+    twap_bins_since_fft: usize,
+    twap_psd_buy: Vec<[f64; 2]>,
+    twap_psd_sell: Vec<[f64; 2]>,
+    twap_peaks_buy: Vec<(f64, f64)>,
+    twap_peaks_sell: Vec<(f64, f64)>,
+    // Parallel volume (USD notional) bins for amplitude estimation
+    twap_vol_bins_buy: VecDeque<f64>,
+    twap_vol_bins_sell: VecDeque<f64>,
+    twap_psd_vol_buy: Vec<[f64; 2]>,
+    twap_psd_vol_sell: Vec<[f64; 2]>,
 }
 
 impl MyApp {
@@ -313,6 +338,27 @@ impl MyApp {
             metrics_timer: 0,
             trade_buffer: std::collections::HashMap::new(),
             heatmap_contrast: 4.0,
+            // TWAP Detector (FFT)
+            show_twap: false,
+            twap_bin_ms: 500,
+            twap_window_bins: 1024,
+            twap_threshold_sigma: 3.0,
+            twap_current_bin_start: 0,
+            twap_current_bin_buy: 0,
+            twap_current_bin_sell: 0,
+            twap_current_vol_buy: 0.0,
+            twap_current_vol_sell: 0.0,
+            twap_bins_buy: VecDeque::with_capacity(1024),
+            twap_bins_sell: VecDeque::with_capacity(1024),
+            twap_bins_since_fft: 0,
+            twap_psd_buy: Vec::new(),
+            twap_psd_sell: Vec::new(),
+            twap_peaks_buy: Vec::new(),
+            twap_peaks_sell: Vec::new(),
+            twap_vol_bins_buy: VecDeque::with_capacity(1024),
+            twap_vol_bins_sell: VecDeque::with_capacity(1024),
+            twap_psd_vol_buy: Vec::new(),
+            twap_psd_vol_sell: Vec::new(),
         }
     }
 
@@ -984,6 +1030,24 @@ impl eframe::App for MyApp {
                     self.otr_history_ask_top20.clear();
                     self.otr_history_both_top20.clear();
 
+                    // TWAP Detector reset
+                    self.twap_bins_buy.clear();
+                    self.twap_bins_sell.clear();
+                    self.twap_psd_buy.clear();
+                    self.twap_psd_sell.clear();
+                    self.twap_peaks_buy.clear();
+                    self.twap_peaks_sell.clear();
+                    self.twap_current_bin_start = 0;
+                    self.twap_current_bin_buy = 0;
+                    self.twap_current_bin_sell = 0;
+                    self.twap_current_vol_buy = 0.0;
+                    self.twap_current_vol_sell = 0.0;
+                    self.twap_bins_since_fft = 0;
+                    self.twap_vol_bins_buy.clear();
+                    self.twap_vol_bins_sell.clear();
+                    self.twap_psd_vol_buy.clear();
+                    self.twap_psd_vol_sell.clear();
+
                     while let Some(update) = self.update_buffer.pop_front() {
                         self.process_update(update);
                     }
@@ -1056,6 +1120,59 @@ impl eframe::App for MyApp {
                             }
                         }
                     }
+
+                    // TWAP Detector: bin trades by transaction_time, split by side
+                    {
+                        let ts = trade.transaction_time;
+                        if self.twap_current_bin_start == 0 {
+                            self.twap_current_bin_start = ts;
+                        }
+                        // USD notional for this trade
+                        let notional = trade.quantity.to_f64().unwrap_or(0.0)
+                            * trade.price.to_f64().unwrap_or(0.0);
+                        // Route to buy or sell counter + volume accumulator
+                        if trade.is_buyer_maker {
+                            self.twap_current_bin_sell += 1; // taker sell (hits bid)
+                            self.twap_current_vol_sell += notional;
+                        } else {
+                            self.twap_current_bin_buy += 1; // taker buy (lifts ask)
+                            self.twap_current_vol_buy += notional;
+                        }
+                        // Close the current bin if its time has elapsed
+                        if ts.saturating_sub(self.twap_current_bin_start) >= self.twap_bin_ms {
+                            self.twap_bins_buy
+                                .push_back(self.twap_current_bin_buy as f64);
+                            self.twap_bins_sell
+                                .push_back(self.twap_current_bin_sell as f64);
+                            self.twap_vol_bins_buy.push_back(self.twap_current_vol_buy);
+                            self.twap_vol_bins_sell
+                                .push_back(self.twap_current_vol_sell);
+                            if self.twap_bins_buy.len() > self.twap_window_bins {
+                                self.twap_bins_buy.pop_front();
+                            }
+                            if self.twap_bins_sell.len() > self.twap_window_bins {
+                                self.twap_bins_sell.pop_front();
+                            }
+                            if self.twap_vol_bins_buy.len() > self.twap_window_bins {
+                                self.twap_vol_bins_buy.pop_front();
+                            }
+                            if self.twap_vol_bins_sell.len() > self.twap_window_bins {
+                                self.twap_vol_bins_sell.pop_front();
+                            }
+                            self.twap_current_bin_buy = 0;
+                            self.twap_current_bin_sell = 0;
+                            self.twap_current_vol_buy = 0.0;
+                            self.twap_current_vol_sell = 0.0;
+                            self.twap_current_bin_start = ts;
+                            self.twap_bins_since_fft += 1;
+                            if self.twap_bins_since_fft >= 32
+                                || (self.twap_psd_buy.is_empty() && self.twap_bins_buy.len() >= 64)
+                            {
+                                self.compute_twap_fft();
+                                self.twap_bins_since_fft = 0;
+                            }
+                        }
+                    }
                 }
                 AppMessage::Ticker(ticker) => {
                     self.apply_ticker_anchor(ticker);
@@ -1079,6 +1196,9 @@ impl eframe::App for MyApp {
             }
             if ui.button("Toggle Microstructure Metrics").clicked() {
                 self.show_metrics = !self.show_metrics;
+            }
+            if ui.button("Toggle TWAP Detector").clicked() {
+                self.show_twap = !self.show_twap;
             }
 
             ui.horizontal(|ui| {
@@ -1131,6 +1251,23 @@ impl eframe::App for MyApp {
                     self.otr_history_bid_top20.clear();
                     self.otr_history_ask_top20.clear();
                     self.otr_history_both_top20.clear();
+                    // TWAP Detector reset
+                    self.twap_bins_buy.clear();
+                    self.twap_bins_sell.clear();
+                    self.twap_psd_buy.clear();
+                    self.twap_psd_sell.clear();
+                    self.twap_peaks_buy.clear();
+                    self.twap_peaks_sell.clear();
+                    self.twap_current_bin_start = 0;
+                    self.twap_current_bin_buy = 0;
+                    self.twap_current_bin_sell = 0;
+                    self.twap_current_vol_buy = 0.0;
+                    self.twap_current_vol_sell = 0.0;
+                    self.twap_bins_since_fft = 0;
+                    self.twap_vol_bins_buy.clear();
+                    self.twap_vol_bins_sell.clear();
+                    self.twap_psd_vol_buy.clear();
+                    self.twap_psd_vol_sell.clear();
                     self.update_counter = 0;
                 }
             });
@@ -1742,6 +1879,199 @@ impl eframe::App for MyApp {
                 });
             // }
 
+            let mut twap_open = self.show_twap;
+            egui::Window::new("TWAP Detector")
+                .open(&mut twap_open)
+                .default_size(Vec2::new(600.0, 600.0))
+                .show(ctx, |ui| {
+                    // Config row
+                    ui.horizontal(|ui| {
+                        ui.label("Bin (ms):");
+                        if ui
+                            .add(egui::Slider::new(&mut self.twap_bin_ms, 100..=5000))
+                            .changed()
+                        {
+                            self.twap_bins_buy.clear();
+                            self.twap_bins_sell.clear();
+                            self.twap_psd_buy.clear();
+                            self.twap_psd_sell.clear();
+                            self.twap_peaks_buy.clear();
+                            self.twap_peaks_sell.clear();
+                            self.twap_current_bin_start = 0;
+                            self.twap_current_bin_buy = 0;
+                            self.twap_current_bin_sell = 0;
+                            self.twap_bins_since_fft = 0;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Window (bins):");
+                        ui.add(egui::Slider::new(&mut self.twap_window_bins, 64..=4096));
+                        ui.label("Sigma:");
+                        ui.add(egui::Slider::new(&mut self.twap_threshold_sigma, 1.0..=6.0));
+                    });
+                    // Sigma change takes effect on next FFT cycle (every 32 bins)
+
+                    ui.separator();
+
+                    let n_buy = self.twap_bins_buy.len();
+                    let n_sell = self.twap_bins_sell.len();
+                    let min_bins = 64_usize;
+                    let n_bins = n_buy.min(n_sell);
+
+                    if n_bins < min_bins {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            ui.heading("Collecting data...");
+                            ui.label(format!(
+                                "Buy: {} / {}   Sell: {} / {}   ({:.0}%)",
+                                n_buy, min_bins, n_sell, min_bins,
+                                (n_bins as f64 / min_bins as f64 * 100.0).min(100.0)
+                            ));
+                            ui.add_space(20.0);
+                        });
+                    } else {
+                        // Helper closure to render one PSD bar chart
+                        let render_psd = |plot_id: &str,
+                                          label: &str,
+                                          color_normal: Color32,
+                                          psd: &Vec<[f64; 2]>,
+                                          psd_vol: &Vec<[f64; 2]>,
+                                          peaks: &Vec<(f64, f64)>,
+                                          n_bins: usize,
+                                          ui: &mut egui::Ui| {
+                            let max_power =
+                                psd.iter().map(|p| p[1]).fold(0.0_f64, f64::max);
+                            let bar_width = if psd.len() > 1 {
+                                (psd[1][0] - psd[0][0]) * 0.8
+                            } else {
+                                0.001
+                            };
+                            let bars: Vec<Bar> = psd
+                                .iter()
+                                .map(|p| {
+                                    let is_peak = peaks.iter().any(|(fp, _)| {
+                                        (p[0] - fp).abs() < bar_width
+                                    });
+                                    let color = if is_peak {
+                                        Color32::from_rgb(255, 200, 0) // gold peak
+                                    } else {
+                                        color_normal
+                                    };
+                                    Bar::new(p[0], p[1]).fill(color).width(bar_width)
+                                })
+                                .collect();
+                            ui.label(label);
+                            ui.allocate_ui(egui::Vec2::new(570.0, 200.0), |ui| {
+                                Plot::new(plot_id)
+                                    .show_axes([true, true])
+                                    .x_axis_label("Frequency (Hz)")
+                                    .y_axis_label("Power")
+                                    .allow_drag(false)
+                                    .allow_scroll(false)
+                                    .allow_zoom(false)
+                                    .show(ui, |plot_ui| {
+                                        plot_ui.bar_chart(BarChart::new(plot_id, bars));
+                                        for (freq, _) in peaks {
+                                            let period = 1.0 / freq;
+                                            let lbl = format!("T={period:.1}s");
+                                            plot_ui.line(
+                                                Line::new(
+                                                    lbl.clone(),
+                                                    PlotPoints::from_iter([
+                                                        [*freq, 0.0],
+                                                        [*freq, max_power * 1.05],
+                                                    ]),
+                                                )
+                                                .color(Color32::from_rgb(255, 80, 80))
+                                                .width(2.0),
+                                            );
+                                            plot_ui.text(
+                                                Text::new(
+                                                    lbl.clone(),
+                                                    PlotPoint::new(*freq, max_power * 1.05),
+                                                    lbl,
+                                                )
+                                                .anchor(Align2::CENTER_BOTTOM),
+                                            );
+                                        }
+                                    });
+                            });
+                            // Detected period list
+                            if peaks.is_empty() {
+                                ui.label("  None above threshold.");
+                            } else {
+                                for (freq, count_power) in peaks {
+                                    let period = 1.0 / freq;
+                                    // Find closest frequency bin in vol PSD
+                                    let vol_power = psd_vol
+                                        .iter()
+                                        .min_by(|a, b| {
+                                            (a[0] - freq)
+                                                .abs()
+                                                .partial_cmp(&(b[0] - freq).abs())
+                                                .unwrap_or(std::cmp::Ordering::Equal)
+                                        })
+                                        .map(|p| p[1])
+                                        .unwrap_or(0.0);
+                                    // N_slice ≈ N_bins × √(2 × PSD_count[f₀])
+                                    let n_slice = n_bins as f64 * (2.0 * count_power).sqrt();
+                                    // USD_slice ≈ N_bins × √(2 × PSD_vol[f₀])
+                                    let usd_slice = n_bins as f64 * (2.0 * vol_power).sqrt();
+                                    let slices_per_hour = 3600.0 / period;
+                                    let usd_k = usd_slice * slices_per_hour / 1000.0;
+                                    ui.label(format!(
+                                        "  T={period:.2}s (f={freq:.4}Hz) | ~{n_slice:.0} trades/slice | ~{usd_slice:.0} USD/slice | ~{usd_k:.0}K/hr"
+                                    ));
+                                }
+                            }
+                        };
+
+                        if !self.twap_psd_buy.is_empty() {
+                            let psd_b = self.twap_psd_buy.clone();
+                            let pks_b = self.twap_peaks_buy.clone();
+                            let psd_vb = self.twap_psd_vol_buy.clone();
+                            render_psd(
+                                "twap_psd_buy",
+                                "Taker Buy TWAP (Lifts Ask)",
+                                Color32::from_rgb(60, 140, 255),
+                                &psd_b,
+                                &psd_vb,
+                                &pks_b,
+                                n_bins,
+                                ui,
+                            );
+                        }
+
+                        ui.separator();
+
+                        if !self.twap_psd_sell.is_empty() {
+                            let psd_s = self.twap_psd_sell.clone();
+                            let pks_s = self.twap_peaks_sell.clone();
+                            let psd_vs = self.twap_psd_vol_sell.clone();
+                            render_psd(
+                                "twap_psd_sell",
+                                "Taker Sell TWAP (Hits Bid)",
+                                Color32::from_rgb(220, 80, 80),
+                                &psd_s,
+                                &psd_vs,
+                                &pks_s,
+                                n_bins,
+                                ui,
+                            );
+                        }
+
+                        ui.separator();
+                        let bin_sec = self.twap_bin_ms as f64 / 1000.0;
+                        ui.label(format!(
+                            "Bins: {}  |  Bin: {}ms  |  Resolution: {:.4} Hz",
+                            n_bins,
+                            self.twap_bin_ms,
+                            1.0 / (n_bins as f64 * bin_sec)
+                        ));
+                    }
+                });
+            self.show_twap = twap_open;
+
             if self.show_liquidity_cost {
                 egui::Window::new("Sweep / Liquidity-Cost")
                     .default_size(Vec2::new(480.0, 320.0))
@@ -2077,5 +2407,97 @@ impl MyApp {
         } else {
             side.insert(*price, VecDeque::from(vec![new_total_qty]));
         }
+    }
+}
+
+impl MyApp {
+    /// Run the FFT TWAP detection pipeline on the current trade-count bins.
+    ///
+    /// Steps:
+    ///   1. Collect N bins (if < 64, abort — too few for reliable FFT).
+    ///   2. Detrend by subtracting the mean.
+    ///   3. Apply Hanning window to reduce spectral leakage.
+    ///   4. Run forward FFT via `rustfft`.
+    ///   5. Compute one-sided PSD (bins 1..=N/2).
+    ///   6. Detect peaks that exceed `mean + sigma * std` of the spectral noise.
+    ///      Store top-5 peaks sorted by power descending.
+    /// Pure FFT pipeline on a slice of bin counts.
+    /// Returns (one-sided PSD, top-5 detected peaks above `sigma`-threshold).
+    fn run_fft_pipeline(
+        bins: &VecDeque<f64>,
+        bin_ms: u64,
+        sigma: f64,
+    ) -> (Vec<[f64; 2]>, Vec<(f64, f64)>) {
+        let n = bins.len();
+        if n < 64 {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Detrend
+        let mean = bins.iter().sum::<f64>() / n as f64;
+        // Hanning window + detrend combined
+        let mut buffer: Vec<Complex<f64>> = bins
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let w =
+                    0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos());
+                Complex {
+                    re: (x - mean) * w,
+                    im: 0.0,
+                }
+            })
+            .collect();
+
+        // FFT
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        fft.process(&mut buffer);
+
+        // One-sided PSD
+        let bin_sec = bin_ms as f64 / 1000.0;
+        let n_f = n as f64;
+        let half = n / 2;
+        let psd: Vec<[f64; 2]> = (1..=half)
+            .map(|k| {
+                let freq = k as f64 / (n_f * bin_sec);
+                let power = 2.0 * buffer[k].norm_sqr() / (n_f * n_f);
+                [freq, power]
+            })
+            .collect();
+
+        // Peak detection (mean + sigma * std threshold)
+        let powers: Vec<f64> = psd.iter().map(|p| p[1]).collect();
+        let p_mean = powers.iter().sum::<f64>() / powers.len() as f64;
+        let p_var = powers.iter().map(|&p| (p - p_mean).powi(2)).sum::<f64>() / powers.len() as f64;
+        let p_std = p_var.sqrt();
+        let threshold = p_mean + sigma * p_std;
+        let mut peaks: Vec<(f64, f64)> = psd
+            .iter()
+            .filter(|p| p[1] > threshold)
+            .map(|p| (p[0], p[1]))
+            .collect();
+        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        peaks.truncate(5);
+
+        (psd, peaks)
+    }
+
+    /// Run FFT on both buy and sell bin series (count + volume) and store results.
+    fn compute_twap_fft(&mut self) {
+        let sigma = self.twap_threshold_sigma;
+        let bin_ms = self.twap_bin_ms;
+        // Count FFTs — also detect peaks
+        let (psd_buy, peaks_buy) = Self::run_fft_pipeline(&self.twap_bins_buy, bin_ms, sigma);
+        let (psd_sell, peaks_sell) = Self::run_fft_pipeline(&self.twap_bins_sell, bin_ms, sigma);
+        // Volume FFTs — PSD only (peaks come from count FFT)
+        let (psd_vol_buy, _) = Self::run_fft_pipeline(&self.twap_vol_bins_buy, bin_ms, sigma);
+        let (psd_vol_sell, _) = Self::run_fft_pipeline(&self.twap_vol_bins_sell, bin_ms, sigma);
+        self.twap_psd_buy = psd_buy;
+        self.twap_peaks_buy = peaks_buy;
+        self.twap_psd_sell = psd_sell;
+        self.twap_peaks_sell = peaks_sell;
+        self.twap_psd_vol_buy = psd_vol_buy;
+        self.twap_psd_vol_sell = psd_vol_sell;
     }
 }
