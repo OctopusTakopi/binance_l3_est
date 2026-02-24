@@ -162,20 +162,14 @@ impl OrderBook {
     /// top-of-book quantities.
     pub fn apply_ticker_anchor(&mut self, ticker: BookTicker) {
         // Safety pruning: resolve any crossed book from stale depth updates.
-        while let Some(&high_bid) = self.bids.keys().next_back() {
-            if high_bid > ticker.best_bid_price {
-                self.bids.pop_last();
-            } else {
-                break;
-            }
+        // Keep bids <= best_bid_price
+        let mut too_high = self.bids.split_off(&ticker.best_bid_price);
+        if let Some(best_bid_val) = too_high.remove(&ticker.best_bid_price) {
+            self.bids.insert(ticker.best_bid_price, best_bid_val);
         }
-        while let Some(&low_ask) = self.asks.keys().next() {
-            if low_ask < ticker.best_ask_price {
-                self.asks.pop_first();
-            } else {
-                break;
-            }
-        }
+
+        // Keep asks >= best_ask_price
+        self.asks = self.asks.split_off(&ticker.best_ask_price);
 
         // Sync best bid.
         Self::reconcile_level(
@@ -232,7 +226,7 @@ impl OrderBook {
                 ticker_price < best
             };
             if new_best {
-                side.insert(ticker_price, VecDeque::from(vec![ticker_qty]));
+                side.insert(ticker_price, VecDeque::from([ticker_qty]));
             }
         }
     }

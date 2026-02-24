@@ -6,6 +6,7 @@ use eframe::egui::{self, Color32, TextureOptions};
 pub struct HeatmapView {
     open: bool,
     pub contrast: f64,
+    auto_scaled: bool,
 }
 
 impl Default for HeatmapView {
@@ -13,6 +14,7 @@ impl Default for HeatmapView {
         Self {
             open: true,
             contrast: 4.0,
+            auto_scaled: false,
         }
     }
 }
@@ -37,18 +39,27 @@ impl AppWindow for HeatmapView {
                     ui.add(egui::Slider::new(&mut self.contrast, 1.0..=10.0));
                     if ui.button("Reset Stats").clicked() {
                         state.heatmap.reset();
+                        self.auto_scaled = false;
+                        self.contrast = 4.0;
                     }
                 });
                 ui.add_space(8.0);
 
                 let hm = &state.heatmap;
-                if hm.warmup_samples < 200 {
+
+                // Auto-scale contrast based on the max Z-score found during warmup
+                if hm.warmup_samples >= 30 && !self.auto_scaled {
+                    self.contrast = (hm.max_z_score + 1.0).clamp(1.0, 10.0);
+                    self.auto_scaled = true;
+                }
+
+                if hm.warmup_samples < 30 {
                     ui.vertical_centered(|ui| {
                         ui.add_space(50.0);
                         ui.heading("Warming up heatmap...");
                         ui.label(format!(
                             "Collecting data: {:.0}%",
-                            (hm.warmup_samples as f64 / 200.0) * 100.0
+                            (hm.warmup_samples as f64 / 30.0) * 100.0
                         ));
                         ui.add_space(50.0);
                     });

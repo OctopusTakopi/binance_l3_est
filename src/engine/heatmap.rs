@@ -13,8 +13,9 @@ pub struct HeatmapState {
     pub rolling_mean_qty: f64,
     /// Rolling EMA of per-level quantity std deviation.
     pub rolling_std_qty: f64,
-    /// Number of samples since the last reset — used for warmup gating.
     pub warmup_samples: usize,
+    /// Maximum Z-score observed during the warmup period, used for auto-scaling UI.
+    pub max_z_score: f64,
     /// Maximum number of columns kept (== displayed width in pixels).
     pub width: usize,
     /// Number of price levels rendered per column (== displayed height in pixels).
@@ -29,6 +30,7 @@ impl HeatmapState {
             rolling_mean_qty: 0.0,
             rolling_std_qty: 1.0,
             warmup_samples: 0,
+            max_z_score: 1.0,
             width,
             height,
         }
@@ -40,6 +42,7 @@ impl HeatmapState {
         self.rolling_mean_qty = 0.0;
         self.rolling_std_qty = 1.0;
         self.warmup_samples = 0;
+        self.max_z_score = 1.0;
     }
 
     /// Update rolling quantity statistics from the current book state.
@@ -55,26 +58,32 @@ impl HeatmapState {
             return;
         }
 
-        let levels: Vec<f64> = bids
+        let iter = bids
             .values()
             .chain(asks.values())
             .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0))
-            .filter(|&q| q > 0.0)
-            .collect();
+            .filter(|&q| q > 0.0);
 
-        if levels.is_empty() {
+        let mut count = 0_usize;
+        let mut sum = 0.0;
+        for q in iter.clone() {
+            sum += q;
+            count += 1;
+        }
+
+        if count == 0 {
             return;
         }
 
-        let m = levels.iter().sum::<f64>() / levels.len() as f64;
-        let v = levels.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / levels.len() as f64;
+        let m = sum / count as f64;
+        let mut var_sum = 0.0;
+        for q in iter {
+            var_sum += (q - m).powi(2);
+        }
+        let v = var_sum / count as f64;
         let s = v.sqrt().max(1e-9);
 
-        let alpha = if self.warmup_samples < 200 {
-            0.05
-        } else {
-            0.01
-        };
+        let alpha = if self.warmup_samples < 30 { 0.05 } else { 0.01 };
 
         if self.rolling_mean_qty == 0.0 {
             self.rolling_mean_qty = m;
@@ -94,12 +103,27 @@ impl HeatmapState {
         asks: &BTreeMap<Decimal, VecDeque<Decimal>>,
     ) {
         self.update_rolling_stats(bids, asks);
-        if self.warmup_samples < 200 {
-            return;
-        }
 
         let mean = self.rolling_mean_qty;
         let std = self.rolling_std_qty.max(1e-9);
+
+        if self.warmup_samples < 30 {
+            let mut local_max_z = 0.0_f64;
+            for (_, qty_deq) in asks.iter().take(self.height / 2) {
+                let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+                if qty > 0.0 {
+                    local_max_z = local_max_z.max((qty - mean) / std);
+                }
+            }
+            for (_, qty_deq) in bids.iter().rev().take(self.height / 2) {
+                let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+                if qty > 0.0 {
+                    local_max_z = local_max_z.max((qty - mean) / std);
+                }
+            }
+            self.max_z_score = self.max_z_score.max(local_max_z);
+            return;
+        }
 
         let mut snapshot = vec![0.0_f64; self.height];
 

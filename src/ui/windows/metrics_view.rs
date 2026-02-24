@@ -32,13 +32,13 @@ impl AppWindow for MetricsView {
                 ui.label("Cancellation-to-Trade Ratio (CTR)");
                 ui.label("CTR > 1.0: Spoofing/Layering > Fills");
 
-                if state.warmup_samples < 200 {
+                if state.warmup_samples < 30 {
                     ui.vertical_centered(|ui| {
                         ui.add_space(50.0);
                         ui.heading("Warming up metrics...");
                         ui.label(format!(
                             "Collecting data: {:.0}%",
-                            (state.warmup_samples as f64 / 200.0) * 100.0
+                            (state.warmup_samples as f64 / 30.0) * 100.0
                         ));
                         ui.add_space(50.0);
                     });

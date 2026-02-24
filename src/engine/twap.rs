@@ -249,9 +249,9 @@ impl TwapDetector {
             })
             .collect();
 
-        let powers: Vec<f64> = psd.iter().map(|p| p[1]).collect();
-        let p_mean = powers.iter().sum::<f64>() / powers.len() as f64;
-        let p_var = powers.iter().map(|&p| (p - p_mean).powi(2)).sum::<f64>() / powers.len() as f64;
+        let n_psd = psd.len() as f64;
+        let p_mean = psd.iter().map(|p| p[1]).sum::<f64>() / n_psd;
+        let p_var = psd.iter().map(|p| (p[1] - p_mean).powi(2)).sum::<f64>() / n_psd;
         let p_std = p_var.sqrt();
         let threshold = p_mean + sigma * p_std;
 

@@ -254,7 +254,7 @@ impl App {
             self.heatmap
                 .update_rolling_stats(&self.order_book.bids, &self.order_book.asks);
             // Only append pixel column once stats are warm.
-            if self.heatmap.warmup_samples >= 200 {
+            if self.heatmap.warmup_samples >= 30 {
                 self.heatmap
                     .append(&self.order_book.bids, &self.order_book.asks);
             }
@@ -270,8 +270,8 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── 1. Periodic metrics sampling ──────────────────────────────────────
         self.metrics_timer += 1;
-        // Sample once warmup finished (200 depth-update batches ≈ 2 000 raw updates)
-        if self.metrics_timer % 10 == 0 && self.warmup_samples >= 200 {
+        // Sample once warmup finished (30 depth-update batches ≈ 300 raw updates)
+        if self.metrics_timer % 10 == 0 && self.warmup_samples >= 30 {
             let now = ctx.input(|i| i.time);
             self.metrics.sample(now);
             self.metrics.prune(now - 200.0);
@@ -285,8 +285,7 @@ impl eframe::App for App {
                     // is preserved so a routine refetch does not flush the plots.
                     self.reset_book_only();
                     self.order_book.apply_snapshot(snap);
-                    let buffered: Vec<_> = self.update_buffer.drain(..).collect();
-                    for update in buffered {
+                    while let Some(update) = self.update_buffer.pop_front() {
                         self.on_depth_update(update);
                     }
                 }
