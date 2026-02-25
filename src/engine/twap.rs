@@ -56,6 +56,8 @@ pub struct TwapDetector {
     // ── Internal compute state ─────────────────────────────────────────────
     /// Planners are expensive to allocate (twiddle factors).
     pub planner: FftPlanner<f64>,
+    /// Pre-allocated buffer for FFT complex values to avoid allocation in hot path.
+    pub fft_buffer: Vec<Complex<f64>>,
 }
 
 impl TwapDetector {
@@ -85,6 +87,7 @@ impl TwapDetector {
             psd_vol_buy: Vec::new(),
             psd_vol_sell: Vec::new(),
             planner: FftPlanner::<f64>::new(),
+            fft_buffer: Vec::with_capacity(1024),
         }
     }
 
@@ -188,14 +191,34 @@ impl TwapDetector {
     pub fn compute_fft(&mut self) {
         let sigma = self.threshold_sigma;
         let bin_ms = self.bin_ms;
-        let (psd_buy, peaks_buy) =
-            Self::run_fft_pipeline(&self.bins_buy, bin_ms, sigma, &mut self.planner);
-        let (psd_sell, peaks_sell) =
-            Self::run_fft_pipeline(&self.bins_sell, bin_ms, sigma, &mut self.planner);
-        let (psd_vol_buy, _) =
-            Self::run_fft_pipeline(&self.vol_bins_buy, bin_ms, sigma, &mut self.planner);
-        let (psd_vol_sell, _) =
-            Self::run_fft_pipeline(&self.vol_bins_sell, bin_ms, sigma, &mut self.planner);
+        let (psd_buy, peaks_buy) = Self::run_fft_pipeline(
+            &self.bins_buy,
+            bin_ms,
+            sigma,
+            &mut self.planner,
+            &mut self.fft_buffer,
+        );
+        let (psd_sell, peaks_sell) = Self::run_fft_pipeline(
+            &self.bins_sell,
+            bin_ms,
+            sigma,
+            &mut self.planner,
+            &mut self.fft_buffer,
+        );
+        let (psd_vol_buy, _) = Self::run_fft_pipeline(
+            &self.vol_bins_buy,
+            bin_ms,
+            sigma,
+            &mut self.planner,
+            &mut self.fft_buffer,
+        );
+        let (psd_vol_sell, _) = Self::run_fft_pipeline(
+            &self.vol_bins_sell,
+            bin_ms,
+            sigma,
+            &mut self.planner,
+            &mut self.fft_buffer,
+        );
         self.psd_buy = psd_buy;
         self.peaks_buy = peaks_buy;
         self.psd_sell = psd_sell;
@@ -215,6 +238,7 @@ impl TwapDetector {
         bin_ms: u64,
         sigma: f64,
         planner: &mut FftPlanner<f64>,
+        buffer: &mut Vec<Complex<f64>>,
     ) -> (Vec<[f64; 2]>, Vec<(f64, f64)>) {
         let n = bins.len();
         if n < 64 {
@@ -222,21 +246,17 @@ impl TwapDetector {
         }
 
         let mean = bins.iter().sum::<f64>() / n as f64;
-        let mut buffer: Vec<Complex<f64>> = bins
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| {
-                let w =
-                    0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos());
-                Complex {
-                    re: (x - mean) * w,
-                    im: 0.0,
-                }
-            })
-            .collect();
+        buffer.clear();
+        buffer.extend(bins.iter().enumerate().map(|(i, &x)| {
+            let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos());
+            Complex {
+                re: (x - mean) * w,
+                im: 0.0,
+            }
+        }));
 
         let fft = planner.plan_fft_forward(n);
-        fft.process(&mut buffer);
+        fft.process(buffer);
 
         let bin_sec = bin_ms as f64 / 1000.0;
         let n_f = n as f64;

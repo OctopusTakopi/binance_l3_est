@@ -20,6 +20,8 @@ pub struct HeatmapState {
     pub width: usize,
     /// Number of price levels rendered per column (== displayed height in pixels).
     pub height: usize,
+    /// Pool of pre-allocated column vectors to reuse instead of allocating new ones.
+    pub snapshot_pool: Vec<Vec<f64>>,
 }
 
 impl HeatmapState {
@@ -33,6 +35,7 @@ impl HeatmapState {
             max_z_score: 1.0,
             width,
             height,
+            snapshot_pool: Vec::new(),
         }
     }
 
@@ -43,6 +46,7 @@ impl HeatmapState {
         self.rolling_std_qty = 1.0;
         self.warmup_samples = 0;
         self.max_z_score = 1.0;
+        self.snapshot_pool.extend(self.data.drain(..));
     }
 
     /// Update rolling quantity statistics from the current book state.
@@ -125,7 +129,12 @@ impl HeatmapState {
             return;
         }
 
-        let mut snapshot = vec![0.0_f64; self.height];
+        let mut snapshot = self
+            .snapshot_pool
+            .pop()
+            .unwrap_or_else(|| vec![0.0_f64; self.height]);
+        // Fast clear just in case it's a reused vector
+        snapshot.fill(0.0_f64);
 
         // Top half → asks (reversed so best ask is nearest mid).
         let ask_iter = asks.iter().take(self.height / 2).rev();
@@ -147,7 +156,9 @@ impl HeatmapState {
 
         self.data.push_back(snapshot);
         if self.data.len() > self.width {
-            self.data.pop_front();
+            if let Some(old_snapshot) = self.data.pop_front() {
+                self.snapshot_pool.push(old_snapshot);
+            }
         }
     }
 }

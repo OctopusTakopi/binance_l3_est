@@ -19,6 +19,9 @@ pub struct OrderBook {
     /// Short-term trade buffer used by MTQR (Marker-Triggered Queue Refining).
     /// Keyed by price; values are `(qty, transaction_time_ms)`.
     pub trade_buffer: HashMap<Decimal, VecDeque<(Decimal, u64)>>,
+    /// Pre-allocated cache for VWAP liquidity curve visualizations
+    pub cached_buy_points: Vec<PlotPoint>,
+    pub cached_sell_points: Vec<PlotPoint>,
 }
 
 impl Default for OrderBook {
@@ -29,6 +32,8 @@ impl Default for OrderBook {
             last_applied_u: 0,
             is_synced: false,
             trade_buffer: HashMap::new(),
+            cached_buy_points: Vec::new(),
+            cached_sell_points: Vec::new(),
         }
     }
 }
@@ -401,7 +406,7 @@ impl OrderBook {
     // ── Analytics Helpers ──────────────────────────────────────────────────────
 
     /// Compute the VWAP buy and sell market-impact curves for the Sweep window.
-    pub fn get_liquidity_curves(&self) -> (Vec<PlotPoint>, Vec<PlotPoint>) {
+    pub fn get_liquidity_curves(&mut self) -> (&[PlotPoint], &[PlotPoint]) {
         let best_bid = self
             .bids
             .keys()
@@ -415,11 +420,15 @@ impl OrderBook {
             .and_then(|p| p.to_f64())
             .unwrap_or(0.0);
         let mid = (best_bid + best_ask) / 2.0;
+
+        self.cached_buy_points.clear();
+        self.cached_sell_points.clear();
+
         if mid == 0.0 {
-            return (vec![], vec![]);
+            return (&self.cached_buy_points, &self.cached_sell_points);
         }
 
-        let mut buy_points = vec![PlotPoint::new(0.0, 0.0)];
+        self.cached_buy_points.push(PlotPoint::new(0.0, 0.0));
         let mut cum_qty = 0.0;
         let mut weighted_price = 0.0;
         for (price, qty_deq) in self.asks.iter() {
@@ -430,11 +439,11 @@ impl OrderBook {
                 let vwap = weighted_price / cum_qty;
                 let delta_p = ((vwap - mid) / mid * 10000.0).abs();
                 let usd = cum_qty * mid;
-                buy_points.push(PlotPoint::new(usd, delta_p));
+                self.cached_buy_points.push(PlotPoint::new(usd, delta_p));
             }
         }
 
-        let mut sell_points = vec![PlotPoint::new(0.0, 0.0)];
+        self.cached_sell_points.push(PlotPoint::new(0.0, 0.0));
         let mut cum_qty = 0.0;
         let mut weighted_price = 0.0;
         for (price, qty_deq) in self.bids.iter().rev() {
@@ -445,11 +454,11 @@ impl OrderBook {
                 let vwap = weighted_price / cum_qty;
                 let delta_p = ((mid - vwap) / mid * 10000.0).abs();
                 let usd = cum_qty * mid;
-                sell_points.push(PlotPoint::new(usd, delta_p));
+                self.cached_sell_points.push(PlotPoint::new(usd, delta_p));
             }
         }
 
-        (buy_points, sell_points)
+        (&self.cached_buy_points, &self.cached_sell_points)
     }
 
     /// Compute the scalar buy and sell price impact (in bps) for a given USD

@@ -99,10 +99,14 @@ impl MiniBatchKMeans {
     /// Fit on the order book slice and return label assignments.
     ///
     /// The returned slice is valid until the next call to `fit`.
-    pub fn fit(&mut self, order_book: &BTreeMap<Decimal, VecDeque<Decimal>>) -> &[usize] {
+    /// The returned slice is valid until the next call to `fit_iter`.
+    pub fn fit_iter<'a, I>(&mut self, iter: I) -> &[usize]
+    where
+        I: Iterator<Item = (&'a Decimal, &'a VecDeque<Decimal>)>,
+    {
         // ── 1. Populate point buffer (reuse capacity) ────────────────────────
         self.points.clear();
-        for (_price, deq) in order_book.iter() {
+        for (_price, deq) in iter {
             for &qty in deq.iter() {
                 if qty > Decimal::ZERO {
                     if let Some(q) = qty.to_f64() {
@@ -242,22 +246,26 @@ impl MiniBatchKMeans {
 
 /// Combine an order book with pre-computed K-Means labels into a
 /// price → `[(qty, cluster)]` map for rendering.
-pub fn build_clustered_orders(
-    order_book: &BTreeMap<Decimal, VecDeque<Decimal>>,
+pub fn build_clustered_orders<'a, I>(
+    iter: I,
     labels: &[usize],
-) -> BTreeMap<Decimal, VecDeque<(Decimal, usize)>> {
-    let mut out: BTreeMap<Decimal, VecDeque<(Decimal, usize)>> = BTreeMap::new();
+) -> Vec<(&'a Decimal, Vec<(Decimal, usize)>)>
+where
+    I: Iterator<Item = (&'a Decimal, &'a VecDeque<Decimal>)>,
+{
+    let mut out = Vec::with_capacity(200);
     let mut idx = 0;
-    for (&price, deq) in order_book.iter() {
-        let entry = out.entry(price).or_default();
+    for (price, deq) in iter {
+        let mut level_orders = Vec::with_capacity(deq.len());
         for &qty in deq.iter() {
             if qty > Decimal::ZERO {
                 if idx < labels.len() {
-                    entry.push_back((qty, labels[idx]));
+                    level_orders.push((qty, labels[idx]));
                     idx += 1;
                 }
             }
         }
+        out.push((price, level_orders));
     }
     out
 }
@@ -271,8 +279,8 @@ pub fn cluster_order_book(
     num_classes: usize,
     batch_size: usize,
     max_iter: usize,
-) -> BTreeMap<Decimal, VecDeque<(Decimal, usize)>> {
+) -> Vec<(&Decimal, Vec<(Decimal, usize)>)> {
     let mut kmeans = MiniBatchKMeans::new(num_classes, batch_size, max_iter);
-    let labels = kmeans.fit(order_book).to_vec(); // one-shot, so copy is fine
-    build_clustered_orders(order_book, &labels)
+    let labels = kmeans.fit_iter(order_book.iter()).to_vec(); // one-shot, so copy is fine
+    build_clustered_orders(order_book.iter(), &labels)
 }

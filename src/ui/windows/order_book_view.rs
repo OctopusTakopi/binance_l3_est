@@ -314,25 +314,13 @@ fn build_kmeans_bars(
     km_ask: &mut MiniBatchKMeans,
     km_bid: &mut MiniBatchKMeans,
 ) -> Vec<Bar> {
-    // Build 200-entry slices lazily — no clone of the whole map.
-    let asks_slice: BTreeMap<Decimal, VecDeque<Decimal>> = asks
-        .iter()
-        .take(200)
-        .map(|(&k, v)| (k, v.clone()))
-        .collect();
-    let bids_slice: BTreeMap<Decimal, VecDeque<Decimal>> = bids
-        .iter()
-        .rev()
-        .take(200)
-        .map(|(&k, v)| (k, v.clone()))
-        .collect();
-
     // Fit using persistent instances — centroids warm-start across frames.
-    let labels_a: Vec<usize> = km_ask.fit(&asks_slice).to_vec();
-    let clustered_a = build_clustered_orders(&asks_slice, &labels_a);
+    // We can pass the iterator directly, avoiding the BTreeMap clone/allocation.
+    let labels_a: Vec<usize> = km_ask.fit_iter(asks.iter().take(200)).to_vec();
+    let clustered_a = build_clustered_orders(asks.iter().take(200), &labels_a);
 
-    let labels_b: Vec<usize> = km_bid.fit(&bids_slice).to_vec();
-    let clustered_b = build_clustered_orders(&bids_slice, &labels_b);
+    let labels_b: Vec<usize> = km_bid.fit_iter(bids.iter().rev().take(200)).to_vec();
+    let clustered_b = build_clustered_orders(bids.iter().rev().take(200), &labels_b);
 
     let mut bars = Vec::new();
     for (i, (_, qty_deq)) in clustered_a.iter().enumerate() {
@@ -359,7 +347,7 @@ fn build_kmeans_bars(
             offset += qty.to_f64().unwrap_or(0.0);
         }
     }
-    for (i, (_, qty_deq)) in clustered_b.iter().rev().enumerate() {
+    for (i, (_, qty_deq)) in clustered_b.iter().enumerate() {
         let x = -(i as f64 + 0.5) * step - 0.5;
         let mut offset = 0.0;
         for &(qty, cluster) in qty_deq.iter() {
