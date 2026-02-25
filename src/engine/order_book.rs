@@ -432,8 +432,12 @@ impl OrderBook {
         let mut cum_qty = 0.0;
         let mut weighted_price = 0.0;
         for (price, qty_deq) in self.asks.iter() {
-            let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
-            weighted_price += level_qty * price.to_f64().unwrap_or(0.0);
+            let p_f64 = price.to_f64().unwrap_or(0.0);
+            let mut level_qty = 0.0;
+            for &q in qty_deq {
+                level_qty += q.to_f64().unwrap_or(0.0);
+            }
+            weighted_price += level_qty * p_f64;
             cum_qty += level_qty;
             if cum_qty > 0.0 {
                 let vwap = weighted_price / cum_qty;
@@ -447,8 +451,12 @@ impl OrderBook {
         let mut cum_qty = 0.0;
         let mut weighted_price = 0.0;
         for (price, qty_deq) in self.bids.iter().rev() {
-            let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
-            weighted_price += level_qty * price.to_f64().unwrap_or(0.0);
+            let p_f64 = price.to_f64().unwrap_or(0.0);
+            let mut level_qty = 0.0;
+            for &q in qty_deq {
+                level_qty += q.to_f64().unwrap_or(0.0);
+            }
+            weighted_price += level_qty * p_f64;
             cum_qty += level_qty;
             if cum_qty > 0.0 {
                 let vwap = weighted_price / cum_qty;
@@ -520,7 +528,10 @@ fn sweep_vwap<'a>(
     let mut last_price = fallback;
     for (price, qty_deq) in iter {
         last_price = price.to_f64().unwrap_or(0.0);
-        let level_qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+        let mut level_qty = 0.0;
+        for &q in qty_deq {
+            level_qty += q.to_f64().unwrap_or(0.0);
+        }
         let remaining = quantity - cum_qty;
         if level_qty >= remaining {
             weighted_price += remaining * last_price;

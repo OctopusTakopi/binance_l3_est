@@ -65,7 +65,13 @@ impl HeatmapState {
         let iter = bids
             .values()
             .chain(asks.values())
-            .map(|v| v.iter().sum::<Decimal>().to_f64().unwrap_or(0.0))
+            .map(|dq| {
+                let mut sum = 0.0;
+                for &q in dq {
+                    sum += q.to_f64().unwrap_or(0.0);
+                }
+                sum
+            })
             .filter(|&q| q > 0.0);
 
         let mut count = 0_usize;
@@ -114,13 +120,19 @@ impl HeatmapState {
         if self.warmup_samples < 30 {
             let mut local_max_z = 0.0_f64;
             for (_, qty_deq) in asks.iter().take(self.height / 2) {
-                let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+                let mut qty = 0.0;
+                for &q in qty_deq {
+                    qty += q.to_f64().unwrap_or(0.0);
+                }
                 if qty > 0.0 {
                     local_max_z = local_max_z.max((qty - mean) / std);
                 }
             }
             for (_, qty_deq) in bids.iter().rev().take(self.height / 2) {
-                let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+                let mut qty = 0.0;
+                for &q in qty_deq {
+                    qty += q.to_f64().unwrap_or(0.0);
+                }
                 if qty > 0.0 {
                     local_max_z = local_max_z.max((qty - mean) / std);
                 }
@@ -139,7 +151,10 @@ impl HeatmapState {
         // Top half → asks (reversed so best ask is nearest mid).
         let ask_iter = asks.iter().take(self.height / 2).rev();
         for (cell, (_, qty_deq)) in snapshot.iter_mut().take(self.height / 2).zip(ask_iter) {
-            let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            let mut qty = 0.0;
+            for &q in qty_deq {
+                qty += q.to_f64().unwrap_or(0.0);
+            }
             if qty > 0.0 {
                 *cell = (qty - mean) / std + 10.0;
             }
@@ -148,7 +163,10 @@ impl HeatmapState {
         // Bottom half → bids (reversed so best bid is nearest mid).
         let bid_iter = bids.iter().rev().take(self.height / 2);
         for (cell, (_, qty_deq)) in snapshot.iter_mut().skip(self.height / 2).zip(bid_iter) {
-            let qty = qty_deq.iter().sum::<Decimal>().to_f64().unwrap_or(0.0);
+            let mut qty = 0.0;
+            for &q in qty_deq {
+                qty += q.to_f64().unwrap_or(0.0);
+            }
             if qty > 0.0 {
                 *cell = -((qty - mean) / std + 10.0); // Negative → bid
             }
