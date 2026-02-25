@@ -191,66 +191,99 @@ impl TwapDetector {
     pub fn compute_fft(&mut self) {
         let sigma = self.threshold_sigma;
         let bin_ms = self.bin_ms;
-        let (psd_buy, peaks_buy) = Self::run_fft_pipeline(
+
+        Self::run_fft_pipeline(
             &self.bins_buy,
             bin_ms,
             sigma,
             &mut self.planner,
             &mut self.fft_buffer,
+            &mut self.psd_buy,
+            Some(&mut self.peaks_buy),
         );
-        let (psd_sell, peaks_sell) = Self::run_fft_pipeline(
+        Self::run_fft_pipeline(
             &self.bins_sell,
             bin_ms,
             sigma,
             &mut self.planner,
             &mut self.fft_buffer,
+            &mut self.psd_sell,
+            Some(&mut self.peaks_sell),
         );
-        let (psd_vol_buy, _) = Self::run_fft_pipeline(
+        Self::run_fft_pipeline(
             &self.vol_bins_buy,
             bin_ms,
             sigma,
             &mut self.planner,
             &mut self.fft_buffer,
+            &mut self.psd_vol_buy,
+            None,
         );
-        let (psd_vol_sell, _) = Self::run_fft_pipeline(
+        Self::run_fft_pipeline(
             &self.vol_bins_sell,
             bin_ms,
             sigma,
             &mut self.planner,
             &mut self.fft_buffer,
+            &mut self.psd_vol_sell,
+            None,
         );
-        self.psd_buy = psd_buy;
-        self.peaks_buy = peaks_buy;
-        self.psd_sell = psd_sell;
-        self.peaks_sell = peaks_sell;
-        self.psd_vol_buy = psd_vol_buy;
-        self.psd_vol_sell = psd_vol_sell;
     }
 
-    /// Pure FFT pipeline: detrend → Hanning window → FFT → one-sided PSD →
-    /// peak detection.
-    ///
-    /// Returns `(psd, peaks)` where `psd` is `Vec<[freq_hz, power]>` and
-    /// `peaks` is up to 5 frequencies above the `sigma`-threshold, sorted by
-    /// power descending.
+    /// Pure FFT pipeline: linear detrend → Hanning window → FFT → one-sided PSD →
+    /// peak detection. Populates outputs in place to avoid allocations.
     pub fn run_fft_pipeline(
         bins: &VecDeque<f64>,
         bin_ms: u64,
         sigma: f64,
         planner: &mut FftPlanner<f64>,
         buffer: &mut Vec<Complex<f64>>,
-    ) -> (Vec<[f64; 2]>, Vec<(f64, f64)>) {
+        psd_out: &mut Vec<[f64; 2]>,
+        mut peaks_out: Option<&mut Vec<(f64, f64)>>,
+    ) {
         let n = bins.len();
-        if n < 64 {
-            return (Vec::new(), Vec::new());
+        psd_out.clear();
+        if let Some(ref mut p) = peaks_out {
+            p.clear();
         }
 
-        let mean = bins.iter().sum::<f64>() / n as f64;
+        if n < 64 {
+            return;
+        }
+
+        let n_f = n as f64;
+
+        // Least-squares linear detrending: y = mx + c
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xy = 0.0;
+        let mut sum_xx = 0.0;
+
+        for (i, &y) in bins.iter().enumerate() {
+            let x = i as f64;
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_xx += x * x;
+        }
+
+        // m = (N*Σ(xy) - Σx*Σy) / (N*Σ(x^2) - (Σx)^2)
+        let denominator = n_f * sum_xx - sum_x * sum_x;
+        let slope = if denominator == 0.0 {
+            0.0
+        } else {
+            (n_f * sum_xy - sum_x * sum_y) / denominator
+        };
+
+        // c = (Σy - m*Σx) / N
+        let intercept = (sum_y - slope * sum_x) / n_f;
+
         buffer.clear();
         buffer.extend(bins.iter().enumerate().map(|(i, &x)| {
-            let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos());
+            let x_detrended = x - (slope * i as f64 + intercept);
+            let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n_f - 1.0)).cos());
             Complex {
-                re: (x - mean) * w,
+                re: x_detrended * w,
                 im: 0.0,
             }
         }));
@@ -259,31 +292,39 @@ impl TwapDetector {
         fft.process(buffer);
 
         let bin_sec = bin_ms as f64 / 1000.0;
-        let n_f = n as f64;
         let half = n / 2;
-        let psd: Vec<[f64; 2]> = (1..=half)
-            .map(|k| {
-                let freq = k as f64 / (n_f * bin_sec);
-                let power = 2.0 * buffer[k].norm_sqr() / (n_f * n_f);
-                [freq, power]
-            })
-            .collect();
 
-        let n_psd = psd.len() as f64;
-        let p_mean = psd.iter().map(|p| p[1]).sum::<f64>() / n_psd;
-        let p_var = psd.iter().map(|p| (p[1] - p_mean).powi(2)).sum::<f64>() / n_psd;
-        let p_std = p_var.sqrt();
-        let threshold = p_mean + sigma * p_std;
+        psd_out.extend((1..=half).map(|k| {
+            let freq = k as f64 / (n_f * bin_sec);
+            let power = 2.0 * buffer[k].norm_sqr() / (n_f * n_f);
+            [freq, power]
+        }));
 
-        let mut peaks: Vec<(f64, f64)> = psd
-            .iter()
-            .filter(|p| p[1] > threshold)
-            .map(|p| (p[0], p[1]))
-            .collect();
-        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        peaks.truncate(5);
+        if let Some(peaks_out) = peaks_out {
+            let n_psd = psd_out.len() as f64;
+            let mut p_sum = 0.0;
+            for p in psd_out.iter() {
+                p_sum += p[1];
+            }
+            let p_mean = p_sum / n_psd;
 
-        (psd, peaks)
+            let mut p_var_sum = 0.0;
+            for p in psd_out.iter() {
+                p_var_sum += (p[1] - p_mean).powi(2);
+            }
+            let p_var = p_var_sum / n_psd;
+            let p_std = p_var.sqrt();
+            let threshold = p_mean + sigma * p_std;
+
+            peaks_out.extend(
+                psd_out
+                    .iter()
+                    .filter(|p| p[1] > threshold)
+                    .map(|p| (p[0], p[1])),
+            );
+            peaks_out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            peaks_out.truncate(5);
+        }
     }
 }
 
