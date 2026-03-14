@@ -34,6 +34,8 @@ pub struct OrderBook {
     best_bid_qty: Option<f64>,
     best_ask_ticks: Option<i64>,
     best_ask_qty: Option<f64>,
+    best_bid_from_ticker: bool,
+    best_ask_from_ticker: bool,
     last_top_update_id: Option<u64>,
 }
 
@@ -59,6 +61,8 @@ impl OrderBook {
             best_bid_qty: None,
             best_ask_ticks: None,
             best_ask_qty: None,
+            best_bid_from_ticker: false,
+            best_ask_from_ticker: false,
             last_top_update_id: None,
         }
     }
@@ -238,8 +242,10 @@ impl OrderBook {
 
         self.best_bid_ticks = Some(best_bid_ticks);
         self.best_bid_qty = Some(ticker.best_bid_qty);
+        self.best_bid_from_ticker = true;
         self.best_ask_ticks = Some(best_ask_ticks);
         self.best_ask_qty = Some(ticker.best_ask_qty);
+        self.best_ask_from_ticker = true;
         self.last_top_update_id = Some(ticker.update_id);
     }
 
@@ -563,6 +569,8 @@ impl OrderBook {
         self.best_bid_qty = None;
         self.best_ask_ticks = None;
         self.best_ask_qty = None;
+        self.best_bid_from_ticker = false;
+        self.best_ask_from_ticker = false;
     }
 
     fn refresh_top_of_book_cache_from_diff(&mut self, is_bid: bool, price_ticks: i64) {
@@ -597,17 +605,36 @@ impl OrderBook {
     fn update_top_of_book_cache_from_side(&mut self, is_bid: bool, price_ticks: i64) {
         let side = if is_bid { &self.bids } else { &self.asks };
         let qty = side.get(&price_ticks).map(|(qty, _)| *qty);
+        let cached_best_ticks = if is_bid {
+            self.best_bid_ticks
+        } else {
+            self.best_ask_ticks
+        };
+        let best_from_ticker = if is_bid {
+            self.best_bid_from_ticker
+        } else {
+            self.best_ask_from_ticker
+        };
+
+        if qty.is_none()
+            && best_from_ticker
+            && cached_best_ticks.is_some_and(|best_ticks| price_ticks != best_ticks)
+        {
+            return;
+        }
 
         if is_bid {
             if let Some(qty) = qty {
                 self.best_bid_ticks = Some(price_ticks);
                 self.best_bid_qty = Some(qty);
+                self.best_bid_from_ticker = false;
             } else {
                 self.promote_top_of_book_from_side(true);
             }
         } else if let Some(qty) = qty {
             self.best_ask_ticks = Some(price_ticks);
             self.best_ask_qty = Some(qty);
+            self.best_ask_from_ticker = false;
         } else {
             self.promote_top_of_book_from_side(false);
         }
@@ -618,16 +645,20 @@ impl OrderBook {
             if let Some((price_ticks, (qty, _))) = self.bids.last_key_value() {
                 self.best_bid_ticks = Some(*price_ticks);
                 self.best_bid_qty = Some(*qty);
+                self.best_bid_from_ticker = false;
             } else {
                 self.best_bid_ticks = None;
                 self.best_bid_qty = None;
+                self.best_bid_from_ticker = false;
             }
         } else if let Some((price_ticks, (qty, _))) = self.asks.first_key_value() {
             self.best_ask_ticks = Some(*price_ticks);
             self.best_ask_qty = Some(*qty);
+            self.best_ask_from_ticker = false;
         } else {
             self.best_ask_ticks = None;
             self.best_ask_qty = None;
+            self.best_ask_from_ticker = false;
         }
     }
 
@@ -809,6 +840,96 @@ mod tests {
 
         assert!(ob.bids.is_empty());
         assert!(ob.asks.is_empty());
+        assert!(ob.best_bid_ask().is_none());
+    }
+
+    #[test]
+    fn test_ticker_overlay_survives_unrelated_diff_removal() {
+        let mut ob = OrderBook::new(1.0);
+        ob.apply_snapshot(OrderBookSnapshot {
+            last_update_id: 10,
+            bids: vec![[100.0, 1.0]],
+            asks: vec![[103.0, 1.0]],
+        });
+        ob.apply_ticker_anchor(BookTicker {
+            update_id: 11,
+            symbol: SymbolStr::from("BTCUSDT"),
+            best_bid_price: 101.0,
+            best_bid_qty: 2.0,
+            best_ask_price: 104.0,
+            best_ask_qty: 3.0,
+            transaction_time: 1_000,
+            event_time: 1_000,
+        });
+
+        let res = ob.process_update(
+            DepthUpdate {
+                event_type: "depthUpdate".to_string(),
+                event_time: 1_001,
+                transaction_time: 1_001,
+                symbol: SymbolStr::from("BTCUSDT"),
+                capital_u: 11,
+                small_u: 11,
+                pu: None,
+                b: vec![],
+                a: vec![[103.0, 0.0]],
+            },
+            0.0,
+        );
+
+        assert_eq!(res, Ok(DepthUpdateStatus::Applied));
+        assert_eq!(ob.best_bid_ask(), Some((101.0, 104.0)));
+    }
+
+    #[test]
+    fn test_exact_diff_invalidation_clears_ticker_overlay() {
+        let mut ob = OrderBook::new(1.0);
+        ob.apply_snapshot(OrderBookSnapshot {
+            last_update_id: 10,
+            bids: vec![[100.0, 1.0]],
+            asks: vec![[103.0, 1.0]],
+        });
+        ob.apply_ticker_anchor(BookTicker {
+            update_id: 11,
+            symbol: SymbolStr::from("BTCUSDT"),
+            best_bid_price: 101.0,
+            best_bid_qty: 2.0,
+            best_ask_price: 104.0,
+            best_ask_qty: 3.0,
+            transaction_time: 1_000,
+            event_time: 1_000,
+        });
+        let _ = ob.process_update(
+            DepthUpdate {
+                event_type: "depthUpdate".to_string(),
+                event_time: 1_001,
+                transaction_time: 1_001,
+                symbol: SymbolStr::from("BTCUSDT"),
+                capital_u: 11,
+                small_u: 11,
+                pu: None,
+                b: vec![],
+                a: vec![[103.0, 0.0]],
+            },
+            0.0,
+        );
+
+        let res = ob.process_update(
+            DepthUpdate {
+                event_type: "depthUpdate".to_string(),
+                event_time: 1_002,
+                transaction_time: 1_002,
+                symbol: SymbolStr::from("BTCUSDT"),
+                capital_u: 12,
+                small_u: 12,
+                pu: Some(11),
+                b: vec![],
+                a: vec![[104.0, 0.0]],
+            },
+            0.0,
+        );
+
+        assert_eq!(res, Ok(DepthUpdateStatus::Applied));
         assert!(ob.best_bid_ask().is_none());
     }
 }
