@@ -376,6 +376,15 @@ impl eframe::App for App {
                     self.qty_prec = spec.qty_prec;
                     self.order_book.set_tick_size(spec.tick_size);
                     self.symbol_spec_ready = true;
+                    if self.network_warning.as_deref().is_some_and(|message| {
+                        message.starts_with("Exchange info")
+                            || message.starts_with("Failed to load exchange info")
+                            || message.starts_with("Symbol spec")
+                    }) {
+                        self.network_warning = None;
+                        self.show_error_popup = false;
+                        self.error_popup_message = None;
+                    }
                 }
                 AppMessage::Snapshot {
                     symbol,
