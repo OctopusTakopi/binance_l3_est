@@ -13,8 +13,6 @@
 //! | `centroids` | `[Point; MAX_K]` — stack inside the struct |
 
 use rand::Rng;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -98,24 +96,21 @@ impl MiniBatchKMeans {
 
     /// Fit on the order book slice and return label assignments.
     ///
-    /// The returned slice is valid until the next call to `fit`.
-    /// The returned slice is valid until the next call to `fit_iter`.
+    /// The returned slice is valid until the next call to `fit` or `fit_iter`.
     pub fn fit_iter<'a, I>(&mut self, iter: I) -> &[usize]
     where
-        I: Iterator<Item = (&'a Decimal, &'a VecDeque<Decimal>)>,
+        I: Iterator<Item = (&'a i64, &'a (f64, VecDeque<f64>))>,
     {
         // ── 1. Populate point buffer (reuse capacity) ────────────────────────
         self.points.clear();
-        for (_price, deq) in iter {
+        for (_price, (_total, deq)) in iter {
             for &qty in deq.iter() {
-                if qty > Decimal::ZERO {
-                    if let Some(q) = qty.to_f64() {
-                        self.points.push(Point { qty: q });
-                    }
+                if qty > 0.0 {
+                    self.points.push(Point { qty });
                 }
             }
         }
-
+        // ... rest of method unchanged ...
         if self.points.is_empty() {
             self.labels.clear();
             return &self.labels;
@@ -130,7 +125,6 @@ impl MiniBatchKMeans {
         }
 
         // ── 3. Mini-batch update loop — zero heap allocation ─────────────────
-        // Stack-allocated accumulators: MAX_K × 8 bytes = 128 bytes each.
         let mut counts = [0u32; MAX_K];
         let mut sums = [0.0f64; MAX_K];
 
@@ -139,7 +133,6 @@ impl MiniBatchKMeans {
         let batch = self.batch_size.min(n);
         let mut rng = rand::rng();
 
-        // Reserve once if needed, then only clear() in the loop.
         if self.batch_indices.capacity() < batch {
             self.batch_indices.reserve(batch);
         }
@@ -150,7 +143,6 @@ impl MiniBatchKMeans {
                 self.batch_indices.push(rng.random_range(0..n));
             }
 
-            // Reset accumulators (stack only, bounded by MAX_K).
             counts[..k].fill(0);
             sums[..k].fill(0.0);
 
@@ -180,7 +172,6 @@ impl MiniBatchKMeans {
         }
 
         // ── 5. Stabilise: remap labels so cluster-0 = smallest centroid ──────
-        // All temporaries on the stack (bounded by MAX_K = 16).
         let mut centroid_order = [0usize; MAX_K];
         for i in 0..k {
             centroid_order[i] = i;
@@ -221,7 +212,6 @@ impl MiniBatchKMeans {
     }
 
     /// Deterministic centroid initialisation: evenly spaced along sorted qty.
-    /// Uses `sort_buf` as scratch — allocation only on the very first call.
     fn initialize_centroids(&mut self) {
         self.sort_buf.clear();
         self.sort_buf.extend_from_slice(&self.points);
@@ -235,7 +225,6 @@ impl MiniBatchKMeans {
             let idx = (i * step).min(n - 1);
             self.centroids[i] = self.sort_buf[idx];
         }
-        // Pad remaining slots with the first point if n < k.
         for i in n.min(k)..k {
             self.centroids[i] = self.sort_buf[0];
         }
@@ -246,19 +235,16 @@ impl MiniBatchKMeans {
 
 /// Combine an order book with pre-computed K-Means labels into a
 /// price → `[(qty, cluster)]` map for rendering.
-pub fn build_clustered_orders<'a, I>(
-    iter: I,
-    labels: &[usize],
-) -> Vec<(&'a Decimal, Vec<(Decimal, usize)>)>
+pub fn build_clustered_orders<'a, I>(iter: I, labels: &[usize]) -> Vec<(&'a i64, Vec<(f64, usize)>)>
 where
-    I: Iterator<Item = (&'a Decimal, &'a VecDeque<Decimal>)>,
+    I: Iterator<Item = (&'a i64, &'a (f64, VecDeque<f64>))>,
 {
     let mut out = Vec::with_capacity(200);
     let mut idx = 0;
-    for (price, deq) in iter {
+    for (price, (_total, deq)) in iter {
         let mut level_orders = Vec::with_capacity(deq.len());
         for &qty in deq.iter() {
-            if qty > Decimal::ZERO {
+            if qty > 0.0 {
                 if idx < labels.len() {
                     level_orders.push((qty, labels[idx]));
                     idx += 1;
@@ -270,17 +256,15 @@ where
     out
 }
 
-/// Convenience wrapper: creates a fresh `MiniBatchKMeans`, fits it, and
-/// returns a fully-owned clustered book. Prefer calling `fit` directly on a
-/// persistent `MiniBatchKMeans` if you want to avoid repeated init overhead.
+/// Convenience wrapper.
 #[allow(dead_code)]
 pub fn cluster_order_book(
-    order_book: &BTreeMap<Decimal, VecDeque<Decimal>>,
+    order_book: &BTreeMap<i64, (f64, VecDeque<f64>)>,
     num_classes: usize,
     batch_size: usize,
     max_iter: usize,
-) -> Vec<(&Decimal, Vec<(Decimal, usize)>)> {
+) -> Vec<(&i64, Vec<(f64, usize)>)> {
     let mut kmeans = MiniBatchKMeans::new(num_classes, batch_size, max_iter);
-    let labels = kmeans.fit_iter(order_book.iter()).to_vec(); // one-shot, so copy is fine
+    let labels = kmeans.fit_iter(order_book.iter()).to_vec();
     build_clustered_orders(order_book.iter(), &labels)
 }

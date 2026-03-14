@@ -1,5 +1,6 @@
 //! Engine sub-modules: order book, metrics, heatmap, TWAP detector, and k-means clustering.
 
+pub mod feature_engine;
 pub mod heatmap;
 pub mod kmeans;
 pub mod metrics;

@@ -58,12 +58,16 @@ impl AppWindow for LiquidityView {
                         });
                 });
 
-                let (buy_impact, sell_impact) = state
+                if let Some((buy_impact, sell_impact)) = state
                     .order_book
-                    .calculate_liquidity_impact(*state.execute_usd);
-                ui.label(format!(
-                    "Buy impact = {buy_impact:.2} bps | Sell impact = {sell_impact:.2} bps"
-                ));
+                    .calculate_liquidity_impact(*state.execute_usd)
+                {
+                    ui.label(format!(
+                        "Buy impact = {buy_impact:.2} bps | Sell impact = {sell_impact:.2} bps"
+                    ));
+                } else {
+                    ui.label("Buy impact = N/A | Sell impact = N/A");
+                }
 
                 ui.horizontal(|ui| {
                     ui.label("Execute USD X:");

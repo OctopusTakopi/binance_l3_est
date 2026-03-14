@@ -3,7 +3,6 @@
 
 use crate::types::Trade;
 use num_complex::Complex;
-use rust_decimal::prelude::ToPrimitive;
 use rustfft::FftPlanner;
 use std::collections::VecDeque;
 
@@ -136,7 +135,7 @@ impl TwapDetector {
             self.current_bin_start = ts;
         }
 
-        let notional = trade.quantity.to_f64().unwrap_or(0.0) * trade.price.to_f64().unwrap_or(0.0);
+        let notional = trade.quantity * trade.price;
 
         if trade.is_buyer_maker {
             self.current_bin_sell += 1;

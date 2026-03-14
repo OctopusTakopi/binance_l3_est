@@ -79,6 +79,21 @@ where
         .map(|value| value.unwrap_or(0.0))
 }
 
+/// Deserialize `[["1.23","4.56"], ...]` into `Vec<[f64; 2]>`.
+pub fn from_str_vec2<'de, D>(deserializer: D) -> Result<Vec<[f64; 2]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<[String; 2]>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|pair| {
+            let price = pair[0].parse::<f64>().map_err(Error::custom)?;
+            let qty = pair[1].parse::<f64>().map_err(Error::custom)?;
+            Ok([price, qty])
+        })
+        .collect()
+}
+
 // ── Option<f64> from optional JSON string ─────────────────────────────────────
 
 struct OptionF64Visitor;

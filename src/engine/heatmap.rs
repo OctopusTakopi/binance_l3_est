@@ -1,7 +1,5 @@
 //! Heatmap state: rolling z-score statistics and depth-time pixel buffer.
 
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use std::collections::{BTreeMap, VecDeque};
 
 /// Manages the depth-time heatmap: rolling orderbook statistics and the
@@ -55,8 +53,8 @@ impl HeatmapState {
     /// rendering begins.
     pub fn update_rolling_stats(
         &mut self,
-        bids: &BTreeMap<Decimal, VecDeque<Decimal>>,
-        asks: &BTreeMap<Decimal, VecDeque<Decimal>>,
+        bids: &BTreeMap<i64, (f64, VecDeque<f64>)>,
+        asks: &BTreeMap<i64, (f64, VecDeque<f64>)>,
     ) {
         if bids.is_empty() || asks.is_empty() {
             return;
@@ -65,13 +63,7 @@ impl HeatmapState {
         let iter = bids
             .values()
             .chain(asks.values())
-            .map(|dq| {
-                let mut sum = 0.0;
-                for &q in dq {
-                    sum += q.to_f64().unwrap_or(0.0);
-                }
-                sum
-            })
+            .map(|(level_total, _)| *level_total)
             .filter(|&q| q > 0.0);
 
         let mut count = 0_usize;
@@ -109,8 +101,8 @@ impl HeatmapState {
     /// sign convention) only if past the warmup threshold.
     pub fn append(
         &mut self,
-        bids: &BTreeMap<Decimal, VecDeque<Decimal>>,
-        asks: &BTreeMap<Decimal, VecDeque<Decimal>>,
+        bids: &BTreeMap<i64, (f64, VecDeque<f64>)>,
+        asks: &BTreeMap<i64, (f64, VecDeque<f64>)>,
     ) {
         self.update_rolling_stats(bids, asks);
 
@@ -119,20 +111,14 @@ impl HeatmapState {
 
         if self.warmup_samples < 30 {
             let mut local_max_z = 0.0_f64;
-            for (_, qty_deq) in asks.iter().take(self.height / 2) {
-                let mut qty = 0.0;
-                for &q in qty_deq {
-                    qty += q.to_f64().unwrap_or(0.0);
-                }
+            for (_, (level_total, _)) in asks.iter().take(self.height / 2) {
+                let qty = *level_total;
                 if qty > 0.0 {
                     local_max_z = local_max_z.max((qty - mean) / std);
                 }
             }
-            for (_, qty_deq) in bids.iter().rev().take(self.height / 2) {
-                let mut qty = 0.0;
-                for &q in qty_deq {
-                    qty += q.to_f64().unwrap_or(0.0);
-                }
+            for (_, (level_total, _)) in bids.iter().rev().take(self.height / 2) {
+                let qty = *level_total;
                 if qty > 0.0 {
                     local_max_z = local_max_z.max((qty - mean) / std);
                 }
@@ -150,11 +136,9 @@ impl HeatmapState {
 
         // Top half → asks (reversed so best ask is nearest mid).
         let ask_iter = asks.iter().take(self.height / 2).rev();
-        for (cell, (_, qty_deq)) in snapshot.iter_mut().take(self.height / 2).zip(ask_iter) {
-            let mut qty = 0.0;
-            for &q in qty_deq {
-                qty += q.to_f64().unwrap_or(0.0);
-            }
+        for (cell, (_, (level_total, _))) in snapshot.iter_mut().take(self.height / 2).zip(ask_iter)
+        {
+            let qty = *level_total;
             if qty > 0.0 {
                 *cell = (qty - mean) / std + 10.0;
             }
@@ -162,11 +146,9 @@ impl HeatmapState {
 
         // Bottom half → bids (reversed so best bid is nearest mid).
         let bid_iter = bids.iter().rev().take(self.height / 2);
-        for (cell, (_, qty_deq)) in snapshot.iter_mut().skip(self.height / 2).zip(bid_iter) {
-            let mut qty = 0.0;
-            for &q in qty_deq {
-                qty += q.to_f64().unwrap_or(0.0);
-            }
+        for (cell, (_, (level_total, _))) in snapshot.iter_mut().skip(self.height / 2).zip(bid_iter)
+        {
+            let qty = *level_total;
             if qty > 0.0 {
                 *cell = -((qty - mean) / std + 10.0); // Negative → bid
             }

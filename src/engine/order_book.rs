@@ -2,287 +2,327 @@
 
 use crate::types::{BookTicker, DepthUpdate, OrderBookSnapshot, Trade};
 use egui_plot::PlotPoint;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
-use rust_decimal_macros::dec;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-/// The core L3-estimated order book.
-///
-/// Bids and asks are stored as price-keyed `BTreeMap`s where each level holds a
-/// `VecDeque<Decimal>` representing the individual estimated order queue.
+type OrderQueue = VecDeque<f64>;
+type BookSide = BTreeMap<i64, (f64, OrderQueue)>;
+
+const QTY_EPSILON: f64 = 1e-12;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OrderBookError {
+    SequenceGap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthUpdateStatus {
+    Applied,
+    IgnoredStale,
+}
+
 pub struct OrderBook {
-    pub bids: BTreeMap<Decimal, VecDeque<Decimal>>,
-    pub asks: BTreeMap<Decimal, VecDeque<Decimal>>,
+    pub bids: BookSide,
+    pub asks: BookSide,
     pub last_applied_u: u64,
     pub is_synced: bool,
-    /// Short-term trade buffer used by MTQR (Marker-Triggered Queue Refining).
-    /// Keyed by price; values are `(qty, transaction_time_ms)`.
-    pub trade_buffer: HashMap<Decimal, VecDeque<(Decimal, u64)>>,
-    /// Pre-allocated cache for VWAP liquidity curve visualizations
+    pub trade_buffer: HashMap<i64, VecDeque<Trade>>,
+    pub last_changes: Vec<LevelChangeResult>,
     pub cached_buy_points: Vec<PlotPoint>,
     pub cached_sell_points: Vec<PlotPoint>,
+    tick_size: f64,
+    best_bid_ticks: Option<i64>,
+    best_bid_qty: Option<f64>,
+    best_ask_ticks: Option<i64>,
+    best_ask_qty: Option<f64>,
+    last_top_update_id: Option<u64>,
 }
 
 impl Default for OrderBook {
     fn default() -> Self {
+        Self::new(0.01)
+    }
+}
+
+impl OrderBook {
+    pub fn new(tick_size: f64) -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             last_applied_u: 0,
             is_synced: false,
-            trade_buffer: HashMap::new(),
+            trade_buffer: HashMap::with_capacity(100),
+            last_changes: Vec::with_capacity(40),
             cached_buy_points: Vec::new(),
             cached_sell_points: Vec::new(),
+            tick_size: tick_size.max(QTY_EPSILON),
+            best_bid_ticks: None,
+            best_bid_qty: None,
+            best_ask_ticks: None,
+            best_ask_qty: None,
+            last_top_update_id: None,
         }
     }
-}
 
-impl OrderBook {
-    // ── Snapshot ───────────────────────────────────────────────────────────────
+    pub fn set_tick_size(&mut self, tick_size: f64) {
+        if tick_size > QTY_EPSILON {
+            self.tick_size = tick_size;
+        }
+    }
 
-    /// Replace book state with a full REST snapshot and reset sync state.
+    pub fn price_to_ticks(&self, price: f64) -> i64 {
+        (price / self.tick_size).round() as i64
+    }
+
+    pub fn ticks_to_price(&self, ticks: i64) -> f64 {
+        ticks as f64 * self.tick_size
+    }
+
     pub fn apply_snapshot(&mut self, snap: OrderBookSnapshot) {
         self.bids.clear();
         self.asks.clear();
+        self.clear_top_of_book_cache();
+        self.trade_buffer.clear();
+        self.last_changes.clear();
+        self.cached_buy_points.clear();
+        self.cached_sell_points.clear();
+
         for bid in &snap.bids {
-            let price = bid[0];
+            let price_ticks = self.price_to_ticks(bid[0]);
             let qty = bid[1];
-            if qty > Decimal::ZERO {
-                self.bids.insert(price, VecDeque::from(vec![qty]));
+            if qty > QTY_EPSILON {
+                self.bids.insert(price_ticks, (qty, VecDeque::from([qty])));
             }
         }
         for ask in &snap.asks {
-            let price = ask[0];
+            let price_ticks = self.price_to_ticks(ask[0]);
             let qty = ask[1];
-            if qty > Decimal::ZERO {
-                self.asks.insert(price, VecDeque::from(vec![qty]));
+            if qty > QTY_EPSILON {
+                self.asks.insert(price_ticks, (qty, VecDeque::from([qty])));
             }
         }
+
         self.last_applied_u = snap.last_update_id;
+        self.last_top_update_id = Some(snap.last_update_id);
         self.is_synced = false;
+        self.seed_top_of_book_cache_from_book();
     }
 
-    /// Clear all book-specific state (called on symbol change).
     pub fn reset(&mut self) {
         self.bids.clear();
         self.asks.clear();
         self.last_applied_u = 0;
         self.is_synced = false;
         self.trade_buffer.clear();
+        self.last_changes.clear();
+        self.cached_buy_points.clear();
+        self.cached_sell_points.clear();
+        self.last_top_update_id = None;
+        self.clear_top_of_book_cache();
     }
 
-    // ── Depth Update Processing ────────────────────────────────────────────────
-
-    /// Attempt to apply a depth update, respecting the sequence-number sync
-    /// protocol.
-    ///
-    /// Returns `Some(results)` with all [`LevelChangeResult`]s so the caller can
-    /// update metrics, or `None` if a refetch was triggered.
     pub fn process_update(
         &mut self,
         update: DepthUpdate,
         rolling_trade_mean: f64,
-        refetch: &mut bool,
-        results_buf: &mut Vec<LevelChangeResult>,
-    ) {
-        if update.small_u < self.last_applied_u {
-            return;
+    ) -> Result<DepthUpdateStatus, OrderBookError> {
+        if self.last_applied_u == 0 {
+            self.reset_after_gap();
+            return Err(OrderBookError::SequenceGap);
         }
 
-        if self.is_synced {
-            if (update.pu as u64) != self.last_applied_u {
+        if update.small_u <= self.last_applied_u {
+            self.last_changes.clear();
+            return Ok(DepthUpdateStatus::IgnoredStale);
+        }
+
+        if !self.is_synced {
+            let next_update_id = self.last_applied_u.saturating_add(1);
+            if update.capital_u > next_update_id || update.small_u < next_update_id {
                 log::warn!(
-                    "Message gap detected! pu={}, last={}",
-                    update.pu,
+                    "Sequence gap on snapshot bridge: U={} u={} expected {}",
+                    update.capital_u,
+                    update.small_u,
+                    next_update_id
+                );
+                self.reset_after_gap();
+                return Err(OrderBookError::SequenceGap);
+            }
+        } else if let Some(prev_u) = update.pu {
+            if prev_u != self.last_applied_u {
+                log::warn!(
+                    "Sequence gap: pu={} != last={}",
+                    prev_u,
                     self.last_applied_u
                 );
-                *refetch = true;
-                return;
+                self.reset_after_gap();
+                return Err(OrderBookError::SequenceGap);
             }
-            self.apply_update(&update, rolling_trade_mean, results_buf);
-        } else if update.capital_u <= self.last_applied_u && self.last_applied_u <= update.small_u {
-            self.apply_update(&update, rolling_trade_mean, results_buf);
-            self.is_synced = true;
         } else {
-            log::warn!(
-                "Initial gap! U={}, u={}, last={}",
-                update.capital_u,
-                update.small_u,
-                self.last_applied_u
-            );
-            *refetch = true;
+            let next_update_id = self.last_applied_u.saturating_add(1);
+            if update.capital_u > next_update_id || update.small_u < next_update_id {
+                log::warn!(
+                    "Sequence gap on diff continuity: U={} u={} expected {}",
+                    update.capital_u,
+                    update.small_u,
+                    next_update_id
+                );
+                self.reset_after_gap();
+                return Err(OrderBookError::SequenceGap);
+            }
         }
+
+        self.last_changes.clear();
+        self.apply_update(&update, rolling_trade_mean);
+        self.last_applied_u = update.small_u;
+        self.last_top_update_id = Some(self.last_top_update_id.unwrap_or(0).max(update.small_u));
+        self.is_synced = true;
+
+        Ok(DepthUpdateStatus::Applied)
     }
 
-    /// Directly apply bids/asks from a depth update to the book.
-    /// Returns all [`LevelChangeResult`]s for the caller (metrics dispatch).
-    fn apply_update(
-        &mut self,
-        update: &DepthUpdate,
-        rolling_trade_mean: f64,
-        results_buf: &mut Vec<LevelChangeResult>,
-    ) {
-        let cap_needed = results_buf.len() + update.b.len() + update.a.len();
-        if results_buf.capacity() < cap_needed {
-            results_buf.reserve(cap_needed - results_buf.len());
-        }
-
+    fn apply_update(&mut self, update: &DepthUpdate, rolling_trade_mean: f64) {
         for bid in &update.b {
-            let price = bid[0];
-            let qty = bid[1];
-            if qty == Decimal::ZERO {
-                self.bids.remove(&price);
-            } else {
-                results_buf.push(self.process_level_change(
-                    &price,
-                    qty,
-                    true,
-                    update.transaction_time,
-                    rolling_trade_mean,
-                ));
+            let price_ticks = self.price_to_ticks(bid[0]);
+            let res = self.process_level_change(
+                price_ticks,
+                bid[1],
+                true,
+                update.transaction_time,
+                rolling_trade_mean,
+            );
+            self.last_changes.push(res);
+
+            let cached_best_bid = self.best_bid_ticks;
+            if self.should_refresh_top_of_book_from_diff(true, price_ticks, cached_best_bid) {
+                self.refresh_top_of_book_cache_from_diff(true, price_ticks);
             }
         }
         for ask in &update.a {
-            let price = ask[0];
-            let qty = ask[1];
-            if qty == Decimal::ZERO {
-                self.asks.remove(&price);
-            } else {
-                results_buf.push(self.process_level_change(
-                    &price,
-                    qty,
-                    false,
-                    update.transaction_time,
-                    rolling_trade_mean,
-                ));
+            let price_ticks = self.price_to_ticks(ask[0]);
+            let res = self.process_level_change(
+                price_ticks,
+                ask[1],
+                false,
+                update.transaction_time,
+                rolling_trade_mean,
+            );
+            self.last_changes.push(res);
+
+            let cached_best_ask = self.best_ask_ticks;
+            if self.should_refresh_top_of_book_from_diff(false, price_ticks, cached_best_ask) {
+                self.refresh_top_of_book_cache_from_diff(false, price_ticks);
             }
         }
-        self.last_applied_u = update.small_u;
     }
 
-    // ── BookTicker Anchor ──────────────────────────────────────────────────────
-
-    /// Use a best-bid/ask tick snapshot to prune crossed quotes and reconcile
-    /// top-of-book quantities.
     pub fn apply_ticker_anchor(&mut self, ticker: BookTicker) {
-        // Safety pruning: resolve any crossed book from stale depth updates.
-        // Keep bids <= best_bid_price
-        let mut too_high = self.bids.split_off(&ticker.best_bid_price);
-        if let Some(best_bid_val) = too_high.remove(&ticker.best_bid_price) {
-            self.bids.insert(ticker.best_bid_price, best_bid_val);
+        if self.last_applied_u == 0 {
+            return;
+        }
+        if ticker.update_id <= self.last_top_update_id.unwrap_or(self.last_applied_u) {
+            return;
         }
 
-        // Keep asks >= best_ask_price
-        self.asks = self.asks.split_off(&ticker.best_ask_price);
+        let best_bid_ticks = self.price_to_ticks(ticker.best_bid_price);
+        let best_ask_ticks = self.price_to_ticks(ticker.best_ask_price);
 
-        // Sync best bid.
-        Self::reconcile_level(
-            &mut self.bids,
-            ticker.best_bid_price,
-            ticker.best_bid_qty,
-            true,
-        );
-        // Sync best ask.
-        Self::reconcile_level(
-            &mut self.asks,
-            ticker.best_ask_price,
-            ticker.best_ask_qty,
-            false,
-        );
+        let mut too_high = self.bids.split_off(&best_bid_ticks);
+        if let Some(best_bid_val) = too_high.remove(&best_bid_ticks) {
+            self.bids.insert(best_bid_ticks, best_bid_val);
+        }
+
+        self.asks = self.asks.split_off(&best_ask_ticks);
+
+        Self::reconcile_level(&mut self.bids, best_bid_ticks, ticker.best_bid_qty, true);
+        Self::reconcile_level(&mut self.asks, best_ask_ticks, ticker.best_ask_qty, false);
+
+        self.best_bid_ticks = Some(best_bid_ticks);
+        self.best_bid_qty = Some(ticker.best_bid_qty);
+        self.best_ask_ticks = Some(best_ask_ticks);
+        self.best_ask_qty = Some(ticker.best_ask_qty);
+        self.last_top_update_id = Some(ticker.update_id);
     }
 
-    fn reconcile_level(
-        side: &mut BTreeMap<Decimal, VecDeque<Decimal>>,
-        ticker_price: Decimal,
-        ticker_qty: Decimal,
-        is_bid: bool,
-    ) {
-        let best_price = if is_bid {
+    fn reconcile_level(side: &mut BookSide, price_ticks: i64, ticker_qty: f64, is_bid: bool) {
+        if side.is_empty() {
+            return;
+        }
+
+        let best_ticks = if is_bid {
             side.keys().next_back().copied()
         } else {
             side.keys().next().copied()
         };
 
-        let Some(best) = best_price else { return };
+        let Some(best) = best_ticks else { return };
 
-        if best == ticker_price {
-            if let Some(queue) = side.get_mut(&best) {
-                let est_total: Decimal = queue.iter().sum();
-                if ticker_qty < est_total {
-                    let mut to_remove = est_total - ticker_qty;
-                    while to_remove > Decimal::ZERO && !queue.is_empty() {
-                        if queue[0] <= to_remove {
+        if best == price_ticks {
+            if let Some((est_total, queue)) = side.get_mut(&best) {
+                if ticker_qty < *est_total {
+                    let mut to_remove = *est_total - ticker_qty;
+                    while to_remove > QTY_EPSILON && !queue.is_empty() {
+                        if queue[0] <= to_remove + QTY_EPSILON {
                             to_remove -= queue[0];
                             queue.pop_front();
                         } else {
                             queue[0] -= to_remove;
-                            to_remove = Decimal::ZERO;
+                            to_remove = 0.0;
                         }
                     }
-                } else if ticker_qty > est_total {
-                    queue.push_back(ticker_qty - est_total);
+                    *est_total = ticker_qty;
+                } else if ticker_qty > *est_total {
+                    queue.push_back(ticker_qty - *est_total);
+                    *est_total = ticker_qty;
                 }
             }
         } else {
             let new_best = if is_bid {
-                ticker_price > best
+                price_ticks > best
             } else {
-                ticker_price < best
+                price_ticks < best
             };
             if new_best {
-                side.insert(ticker_price, VecDeque::from([ticker_qty]));
+                side.insert(price_ticks, (ticker_qty, VecDeque::from([ticker_qty])));
             }
         }
     }
 
-    // ── Level Change / SOFP / MTQR ────────────────────────────────────────────
-
-    /// Process a level-quantity change with SOFP fragmentation and MTQR fill
-    /// attribution.
-    ///
-    /// Returns `(inflow_diff, cancel_diff, is_tob, in_top20)` for metrics
-    /// tracking.
     pub fn process_level_change(
         &mut self,
-        price: &Decimal,
-        new_total_qty: Decimal,
+        price_ticks: i64,
+        new_total_qty: f64,
         is_bid: bool,
         ts: u64,
         rolling_trade_mean: f64,
     ) -> LevelChangeResult {
-        // 1. Determine position *before* mutable borrow.
         let is_tob = if is_bid {
-            self.bids.keys().next_back() == Some(price)
+            self.best_bid_ticks.map_or(true, |best| price_ticks >= best)
         } else {
-            self.asks.keys().next() == Some(price)
+            self.best_ask_ticks.map_or(true, |best| price_ticks <= best)
         };
         let in_top20 = if is_bid {
-            self.bids.keys().rev().take(20).any(|p| p == price)
+            self.bids.keys().rev().take(20).any(|&p| p == price_ticks) || self.bids.len() < 20
         } else {
-            self.asks.keys().take(20).any(|p| p == price)
+            self.asks.keys().take(20).any(|&p| p == price_ticks) || self.asks.len() < 20
         };
 
-        // 2. Mutable work.
-        let side: &mut BTreeMap<Decimal, VecDeque<Decimal>> = if is_bid {
+        let side = if is_bid {
             &mut self.bids
         } else {
             &mut self.asks
         };
 
-        if let Some(queue) = side.get_mut(price) {
-            let old_total: Decimal = queue.iter().sum();
+        if let Some((total_qty, queue)) = side.get_mut(&price_ticks) {
+            let old_total = *total_qty;
 
-            if new_total_qty > old_total {
-                // INFLOW: Liquidity added.
+            if new_total_qty > old_total + QTY_EPSILON {
                 let diff = new_total_qty - old_total;
 
-                if !is_tob && diff > dec!(0.1) {
+                if !is_tob && diff > 0.1 {
                     let avg_trade = rolling_trade_mean.max(0.001);
-                    let diff_f = diff.to_f64().unwrap_or(0.0);
-                    if diff_f > avg_trade * 2.0 && diff_f < avg_trade * 20.0 {
-                        let num_fragments = (diff_f / avg_trade).min(5.0).max(2.0) as usize;
-                        let fragment_val = (diff / Decimal::from(num_fragments)).round_dp(8);
+                    if diff > avg_trade * 2.0 && diff < avg_trade * 20.0 {
+                        let num_fragments = (diff / avg_trade).clamp(2.0, 5.0) as usize;
+                        let fragment_val = diff / num_fragments as f64;
                         let mut remaining = diff;
                         for i in 0..num_fragments {
                             if i == num_fragments - 1 {
@@ -299,42 +339,51 @@ impl OrderBook {
                     queue.push_back(diff);
                 }
 
+                *total_qty = new_total_qty;
+
                 return LevelChangeResult {
-                    inflow: diff.to_f64().unwrap_or(0.0),
+                    inflow: diff,
                     cancel: 0.0,
                     is_tob,
                     in_top20,
                     is_bid,
                 };
-            } else if new_total_qty < old_total {
-                // OUTFLOW: Liquidity reduced.
+            } else if new_total_qty < old_total - QTY_EPSILON {
                 let mut remaining_to_remove = old_total - new_total_qty;
 
-                // MTQR: consume matched trades first (FIFO).
-                if let Some(trade_deq) = self.trade_buffer.get_mut(price) {
-                    while let Some(&trade) = trade_deq.front() {
-                        if ts >= trade.1 && ts - trade.1 < 1000 {
-                            let trade_qty = trade.0;
+                if let Some(trade_deq) = self.trade_buffer.get_mut(&price_ticks) {
+                    while let Some(trade) = trade_deq.front_mut() {
+                        if ts >= trade.transaction_time && ts - trade.transaction_time < 1000 {
+                            let trade_qty = trade.quantity;
                             if !queue.is_empty() && queue[0] < trade_qty {
                                 queue[0] = trade_qty;
                             }
-                            let consumed = remaining_to_remove.min(trade_qty);
+                            let consumed = trade.quantity.min(remaining_to_remove);
+
                             let mut inner_remaining = consumed;
-                            while inner_remaining > Decimal::ZERO && !queue.is_empty() {
-                                if queue[0] <= inner_remaining {
+                            while inner_remaining > QTY_EPSILON && !queue.is_empty() {
+                                if queue[0] <= inner_remaining + QTY_EPSILON {
                                     inner_remaining -= queue[0];
                                     queue.pop_front();
                                 } else {
                                     queue[0] -= inner_remaining;
-                                    inner_remaining = Decimal::ZERO;
+                                    inner_remaining = 0.0;
                                 }
                             }
+
                             remaining_to_remove -= consumed;
-                            trade_deq.pop_front();
-                            if remaining_to_remove == Decimal::ZERO {
+                            trade.quantity -= consumed;
+                            *total_qty -= consumed;
+
+                            if trade.quantity <= QTY_EPSILON {
+                                trade.quantity = 0.0;
+                                trade_deq.pop_front();
+                            }
+
+                            if remaining_to_remove <= QTY_EPSILON {
                                 break;
                             }
-                        } else if trade.1 > ts {
+                        } else if trade.transaction_time > ts {
                             break;
                         } else {
                             trade_deq.pop_front();
@@ -342,23 +391,31 @@ impl OrderBook {
                     }
                 }
 
-                if remaining_to_remove > Decimal::ZERO {
-                    // Cancel / modification (LIFO with priority reset).
-                    let cancel = remaining_to_remove.to_f64().unwrap_or(0.0);
+                if remaining_to_remove > QTY_EPSILON {
+                    let cancel = remaining_to_remove;
 
-                    if let Some(pos) = queue.iter().rposition(|&x| x == remaining_to_remove) {
+                    if let Some(pos) = queue
+                        .iter()
+                        .rposition(|&x| (x - remaining_to_remove).abs() <= QTY_EPSILON)
+                    {
                         queue.remove(pos);
                     } else {
-                        while remaining_to_remove > Decimal::ZERO && !queue.is_empty() {
+                        while remaining_to_remove > QTY_EPSILON && !queue.is_empty() {
                             let last_idx = queue.len() - 1;
-                            if queue[last_idx] <= remaining_to_remove {
+                            if queue[last_idx] <= remaining_to_remove + QTY_EPSILON {
                                 remaining_to_remove -= queue[last_idx];
                                 queue.pop_back();
                             } else {
                                 queue[last_idx] -= remaining_to_remove;
-                                remaining_to_remove = Decimal::ZERO;
+                                remaining_to_remove = 0.0;
                             }
                         }
+                    }
+
+                    if new_total_qty <= QTY_EPSILON {
+                        side.remove(&price_ticks);
+                    } else {
+                        *total_qty = new_total_qty;
                     }
 
                     return LevelChangeResult {
@@ -370,8 +427,18 @@ impl OrderBook {
                     };
                 }
             }
-        } else {
-            side.insert(*price, VecDeque::from(vec![new_total_qty]));
+        } else if new_total_qty > QTY_EPSILON {
+            side.insert(
+                price_ticks,
+                (new_total_qty, VecDeque::from([new_total_qty])),
+            );
+            return LevelChangeResult {
+                inflow: new_total_qty,
+                cancel: 0.0,
+                is_tob,
+                in_top20,
+                is_bid,
+            };
         }
 
         LevelChangeResult {
@@ -383,18 +450,16 @@ impl OrderBook {
         }
     }
 
-    // ── Trade Buffer ───────────────────────────────────────────────────────────
-
-    /// Record a trade for MTQR attribution and expire entries older than 10 s.
     pub fn record_trade(&mut self, trade: &Trade) {
+        let price_ticks = self.price_to_ticks(trade.price);
         self.trade_buffer
-            .entry(trade.price)
+            .entry(price_ticks)
             .or_default()
-            .push_back((trade.quantity, trade.transaction_time));
+            .push_back(trade.clone());
         let now = trade.transaction_time;
         for deq in self.trade_buffer.values_mut() {
-            while let Some(&front) = deq.front() {
-                if now > front.1 + 10_000 {
+            while let Some(front) = deq.front() {
+                if now > front.transaction_time + 10_000 {
                     deq.pop_front();
                 } else {
                     break;
@@ -403,152 +468,347 @@ impl OrderBook {
         }
     }
 
-    // ── Analytics Helpers ──────────────────────────────────────────────────────
-
-    /// Compute the VWAP buy and sell market-impact curves for the Sweep window.
     pub fn get_liquidity_curves(&mut self) -> (&[PlotPoint], &[PlotPoint]) {
-        let best_bid = self
-            .bids
-            .keys()
-            .next_back()
-            .and_then(|p| p.to_f64())
-            .unwrap_or(0.0);
-        let best_ask = self
-            .asks
-            .keys()
-            .next()
-            .and_then(|p| p.to_f64())
-            .unwrap_or(0.0);
-        let mid = (best_bid + best_ask) / 2.0;
-
         self.cached_buy_points.clear();
         self.cached_sell_points.clear();
 
-        if mid == 0.0 {
+        let Some(mid) = self.mid_price() else {
+            return (&self.cached_buy_points, &self.cached_sell_points);
+        };
+        if mid <= QTY_EPSILON {
             return (&self.cached_buy_points, &self.cached_sell_points);
         }
 
         self.cached_buy_points.push(PlotPoint::new(0.0, 0.0));
         let mut cum_qty = 0.0;
         let mut weighted_price = 0.0;
-        for (price, qty_deq) in self.asks.iter() {
-            let p_f64 = price.to_f64().unwrap_or(0.0);
-            let mut level_qty = 0.0;
-            for &q in qty_deq {
-                level_qty += q.to_f64().unwrap_or(0.0);
-            }
-            weighted_price += level_qty * p_f64;
-            cum_qty += level_qty;
-            if cum_qty > 0.0 {
+        for (price_ticks, (level_total, _)) in &self.asks {
+            let price = self.ticks_to_price(*price_ticks);
+            weighted_price += level_total * price;
+            cum_qty += *level_total;
+            if cum_qty > QTY_EPSILON {
                 let vwap = weighted_price / cum_qty;
-                let delta_p = ((vwap - mid) / mid * 10000.0).abs();
-                let usd = cum_qty * mid;
-                self.cached_buy_points.push(PlotPoint::new(usd, delta_p));
+                let delta_p = ((vwap - mid) / mid * 10_000.0).abs();
+                self.cached_buy_points
+                    .push(PlotPoint::new(cum_qty * mid, delta_p));
             }
         }
 
         self.cached_sell_points.push(PlotPoint::new(0.0, 0.0));
         let mut cum_qty = 0.0;
         let mut weighted_price = 0.0;
-        for (price, qty_deq) in self.bids.iter().rev() {
-            let p_f64 = price.to_f64().unwrap_or(0.0);
-            let mut level_qty = 0.0;
-            for &q in qty_deq {
-                level_qty += q.to_f64().unwrap_or(0.0);
-            }
-            weighted_price += level_qty * p_f64;
-            cum_qty += level_qty;
-            if cum_qty > 0.0 {
+        for (price_ticks, (level_total, _)) in self.bids.iter().rev() {
+            let price = self.ticks_to_price(*price_ticks);
+            weighted_price += level_total * price;
+            cum_qty += *level_total;
+            if cum_qty > QTY_EPSILON {
                 let vwap = weighted_price / cum_qty;
-                let delta_p = ((mid - vwap) / mid * 10000.0).abs();
-                let usd = cum_qty * mid;
-                self.cached_sell_points.push(PlotPoint::new(usd, delta_p));
+                let delta_p = ((mid - vwap) / mid * 10_000.0).abs();
+                self.cached_sell_points
+                    .push(PlotPoint::new(cum_qty * mid, delta_p));
             }
         }
 
         (&self.cached_buy_points, &self.cached_sell_points)
     }
 
-    /// Compute the scalar buy and sell price impact (in bps) for a given USD
-    /// trade size.
-    pub fn calculate_liquidity_impact(&self, execute_usd: f64) -> (f64, f64) {
-        if self.bids.is_empty() || self.asks.is_empty() {
-            return (0.0, 0.0);
+    pub fn calculate_liquidity_impact(&self, execute_usd: f64) -> Option<(f64, f64)> {
+        let mid = self.mid_price()?;
+        if mid <= QTY_EPSILON {
+            return None;
         }
-        let best_bid = self
-            .bids
-            .keys()
-            .next_back()
-            .and_then(|p| p.to_f64())
-            .unwrap_or(0.0);
-        let best_ask = self
-            .asks
-            .keys()
-            .next()
-            .and_then(|p| p.to_f64())
-            .unwrap_or(0.0);
-        let mid = (best_bid + best_ask) / 2.0;
-        if mid == 0.0 {
-            return (0.0, 0.0);
-        }
+
         let quantity = execute_usd / mid;
+        let buy_vwap = sweep_vwap(self.asks.iter(), quantity, self.tick_size)?;
+        let sell_vwap = sweep_vwap(self.bids.iter().rev(), quantity, self.tick_size)?;
 
-        // Buy (sweep asks)
-        let buy_vwap = sweep_vwap(self.asks.iter(), quantity, best_ask);
-        let buy_impact = ((buy_vwap - mid) / mid * 10000.0).abs();
+        Some((
+            ((buy_vwap - mid) / mid * 10_000.0).abs(),
+            ((mid - sell_vwap) / mid * 10_000.0).abs(),
+        ))
+    }
 
-        // Sell (sweep bids, reversed)
-        let sell_vwap = sweep_vwap(self.bids.iter().rev(), quantity, best_bid);
-        let sell_impact = ((mid - sell_vwap) / mid * 10000.0).abs();
+    pub fn best_bid_ask(&self) -> Option<(f64, f64)> {
+        Some((
+            self.ticks_to_price(self.best_bid_ticks?),
+            self.ticks_to_price(self.best_ask_ticks?),
+        ))
+    }
 
-        (buy_impact, sell_impact)
+    pub fn mid_price(&self) -> Option<f64> {
+        let (best_bid, best_ask) = self.best_bid_ask()?;
+        Some((best_bid + best_ask) / 2.0)
+    }
+
+    fn seed_top_of_book_cache_from_book(&mut self) {
+        if let Some((price_ticks, (qty, _))) = self.bids.last_key_value() {
+            self.best_bid_ticks = Some(*price_ticks);
+            self.best_bid_qty = Some(*qty);
+        } else {
+            self.best_bid_ticks = None;
+            self.best_bid_qty = None;
+        }
+
+        if let Some((price_ticks, (qty, _))) = self.asks.first_key_value() {
+            self.best_ask_ticks = Some(*price_ticks);
+            self.best_ask_qty = Some(*qty);
+        } else {
+            self.best_ask_ticks = None;
+            self.best_ask_qty = None;
+        }
+    }
+
+    fn clear_top_of_book_cache(&mut self) {
+        self.best_bid_ticks = None;
+        self.best_bid_qty = None;
+        self.best_ask_ticks = None;
+        self.best_ask_qty = None;
+    }
+
+    fn refresh_top_of_book_cache_from_diff(&mut self, is_bid: bool, price_ticks: i64) {
+        let cached_best_ticks = if is_bid {
+            self.best_bid_ticks
+        } else {
+            self.best_ask_ticks
+        };
+
+        if cached_best_ticks.is_none() {
+            self.promote_top_of_book_from_side(is_bid);
+            return;
+        }
+
+        self.update_top_of_book_cache_from_side(is_bid, price_ticks);
+    }
+
+    fn should_refresh_top_of_book_from_diff(
+        &self,
+        is_bid: bool,
+        price_ticks: i64,
+        cached_best_ticks: Option<i64>,
+    ) -> bool {
+        match cached_best_ticks {
+            None => true,
+            Some(best_ticks) if price_ticks == best_ticks => true,
+            Some(best_ticks) if is_bid => price_ticks > best_ticks,
+            Some(best_ticks) => price_ticks < best_ticks,
+        }
+    }
+
+    fn update_top_of_book_cache_from_side(&mut self, is_bid: bool, price_ticks: i64) {
+        let side = if is_bid { &self.bids } else { &self.asks };
+        let qty = side.get(&price_ticks).map(|(qty, _)| *qty);
+
+        if is_bid {
+            if let Some(qty) = qty {
+                self.best_bid_ticks = Some(price_ticks);
+                self.best_bid_qty = Some(qty);
+            } else {
+                self.promote_top_of_book_from_side(true);
+            }
+        } else if let Some(qty) = qty {
+            self.best_ask_ticks = Some(price_ticks);
+            self.best_ask_qty = Some(qty);
+        } else {
+            self.promote_top_of_book_from_side(false);
+        }
+    }
+
+    fn promote_top_of_book_from_side(&mut self, is_bid: bool) {
+        if is_bid {
+            if let Some((price_ticks, (qty, _))) = self.bids.last_key_value() {
+                self.best_bid_ticks = Some(*price_ticks);
+                self.best_bid_qty = Some(*qty);
+            } else {
+                self.best_bid_ticks = None;
+                self.best_bid_qty = None;
+            }
+        } else if let Some((price_ticks, (qty, _))) = self.asks.first_key_value() {
+            self.best_ask_ticks = Some(*price_ticks);
+            self.best_ask_qty = Some(*qty);
+        } else {
+            self.best_ask_ticks = None;
+            self.best_ask_qty = None;
+        }
+    }
+
+    fn reset_after_gap(&mut self) {
+        self.bids.clear();
+        self.asks.clear();
+        self.trade_buffer.clear();
+        self.last_changes.clear();
+        self.cached_buy_points.clear();
+        self.cached_sell_points.clear();
+        self.last_applied_u = 0;
+        self.last_top_update_id = None;
+        self.is_synced = false;
+        self.clear_top_of_book_cache();
     }
 }
 
-/// Result returned by [`OrderBook::process_level_change`].
 pub struct LevelChangeResult {
-    /// Quantity of liquidity added at this level (0 if outflow).
     pub inflow: f64,
-    /// Quantity attributed to cancellations at this level (0 if inflow).
     pub cancel: f64,
     pub is_tob: bool,
     pub in_top20: bool,
     pub is_bid: bool,
 }
 
-// ── Private helper ──────────────────────────────────────────────────────────
-
 fn sweep_vwap<'a>(
-    iter: impl Iterator<Item = (&'a Decimal, &'a VecDeque<Decimal>)>,
+    iter: impl Iterator<Item = (&'a i64, &'a (f64, OrderQueue))>,
     quantity: f64,
-    fallback: f64,
-) -> f64 {
-    let mut cum_qty = 0.0;
-    let mut weighted_price = 0.0;
-    let mut last_price = fallback;
-    for (price, qty_deq) in iter {
-        last_price = price.to_f64().unwrap_or(0.0);
-        let mut level_qty = 0.0;
-        for &q in qty_deq {
-            level_qty += q.to_f64().unwrap_or(0.0);
-        }
-        let remaining = quantity - cum_qty;
-        if level_qty >= remaining {
-            weighted_price += remaining * last_price;
-            cum_qty += remaining;
+    tick_size: f64,
+) -> Option<f64> {
+    let mut remaining = quantity;
+    let mut notional = 0.0;
+    let mut filled = 0.0;
+
+    for (price_ticks, (level_total, _)) in iter {
+        if remaining <= QTY_EPSILON {
             break;
-        } else {
-            weighted_price += level_qty * last_price;
-            cum_qty += level_qty;
         }
+
+        let price = *price_ticks as f64 * tick_size;
+        let take_qty = level_total.min(remaining);
+        notional += take_qty * price;
+        filled += take_qty;
+        remaining -= take_qty;
     }
-    if cum_qty < quantity {
-        weighted_price += (quantity - cum_qty) * last_price;
-        cum_qty = quantity;
-    }
-    if cum_qty > 0.0 {
-        weighted_price / cum_qty
+
+    if filled <= QTY_EPSILON || remaining > QTY_EPSILON {
+        None
     } else {
-        fallback
+        Some(notional / filled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::SymbolStr;
+
+    fn approx_eq(left: f64, right: f64) {
+        assert!((left - right).abs() < 1e-9, "{left} != {right}");
+    }
+
+    #[test]
+    fn test_tick_round_trip() {
+        let ob = OrderBook::new(0.1);
+        let price = 50000.3;
+        let ticks = ob.price_to_ticks(price);
+        assert_eq!(ticks, 500003);
+        approx_eq(ob.ticks_to_price(ticks), price);
+    }
+
+    #[test]
+    fn test_process_update_inflow() {
+        let mut ob = OrderBook::default();
+        ob.last_applied_u = 100;
+        ob.is_synced = true;
+
+        let update = DepthUpdate {
+            event_type: "depthUpdate".to_string(),
+            event_time: 1000,
+            transaction_time: 1000,
+            symbol: SymbolStr::from("BTCUSDT"),
+            capital_u: 101,
+            small_u: 101,
+            pu: Some(100),
+            b: vec![[50000.0, 1.5]],
+            a: vec![],
+        };
+
+        let res = ob.process_update(update, 0.0);
+        assert_eq!(res, Ok(DepthUpdateStatus::Applied));
+        assert_eq!(ob.last_changes.len(), 1);
+        approx_eq(ob.last_changes[0].inflow, 1.5);
+        assert!(ob.last_changes[0].is_bid);
+    }
+
+    #[test]
+    fn test_process_update_gap() {
+        let mut ob = OrderBook::default();
+        ob.last_applied_u = 100;
+        ob.is_synced = true;
+
+        let update = DepthUpdate {
+            event_type: "depthUpdate".to_string(),
+            event_time: 1000,
+            transaction_time: 1000,
+            symbol: SymbolStr::from("BTCUSDT"),
+            capital_u: 105,
+            small_u: 105,
+            pu: Some(104),
+            b: vec![[50000.0, 1.5]],
+            a: vec![],
+        };
+
+        let res = ob.process_update(update, 0.0);
+        assert_eq!(res, Err(OrderBookError::SequenceGap));
+    }
+
+    #[test]
+    fn test_first_update_must_bridge_snapshot() {
+        let mut ob = OrderBook::default();
+        ob.apply_snapshot(OrderBookSnapshot {
+            last_update_id: 100,
+            bids: vec![[50000.0, 1.0]],
+            asks: vec![[50001.0, 2.0]],
+        });
+
+        let update = DepthUpdate {
+            event_type: "depthUpdate".to_string(),
+            event_time: 1000,
+            transaction_time: 1000,
+            symbol: SymbolStr::from("BTCUSDT"),
+            capital_u: 102,
+            small_u: 102,
+            pu: Some(100),
+            b: vec![[50000.0, 1.5]],
+            a: vec![],
+        };
+
+        let res = ob.process_update(update, 0.0);
+        assert_eq!(res, Err(OrderBookError::SequenceGap));
+    }
+
+    #[test]
+    fn test_stale_update_is_ignored() {
+        let mut ob = OrderBook::default();
+        ob.last_applied_u = 105;
+        ob.is_synced = true;
+
+        let update = DepthUpdate {
+            event_type: "depthUpdate".to_string(),
+            event_time: 1000,
+            transaction_time: 1000,
+            symbol: SymbolStr::from("BTCUSDT"),
+            capital_u: 104,
+            small_u: 105,
+            pu: Some(104),
+            b: vec![[50000.0, 1.5]],
+            a: vec![],
+        };
+
+        let res = ob.process_update(update, 0.0);
+        assert_eq!(res, Ok(DepthUpdateStatus::IgnoredStale));
+    }
+
+    #[test]
+    fn test_ticker_anchor_ignored_before_snapshot() {
+        let mut ob = OrderBook::default();
+        ob.apply_ticker_anchor(BookTicker {
+            update_id: 10,
+            symbol: SymbolStr::from("BTCUSDT"),
+            best_bid_price: 50000.0,
+            best_bid_qty: 1.0,
+            best_ask_price: 50001.0,
+            best_ask_qty: 2.0,
+            transaction_time: 1_000,
+            event_time: 1_000,
+        });
+
+        assert!(ob.bids.is_empty());
+        assert!(ob.asks.is_empty());
+        assert!(ob.best_bid_ask().is_none());
     }
 }
