@@ -55,6 +55,7 @@ pub struct App {
     max_liquidity_usd: f64,
     price_prec: usize,
     qty_prec: usize,
+    symbol_spec_ready: bool,
 
     // ── Update buffer for pre-snapshot depth events ────────────────────────
     update_buffer: VecDeque<crate::types::DepthUpdate>,
@@ -94,11 +95,25 @@ impl App {
                 ));
         });
 
-        let spec_cache = client::fetch_exchange_specs(market).ok();
-        let spec = spec_cache
-            .as_ref()
-            .and_then(|cache| client::lookup_symbol_spec(cache, &symbol, market))
-            .unwrap_or_default();
+        let startup_spec = match client::fetch_exchange_specs(market) {
+            Ok(cache) => client::lookup_symbol_spec(&cache, &symbol, market)
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    Err(format!(
+                        "Symbol spec not found in exchange info for {} on {}.",
+                        symbol.to_uppercase(),
+                        market.as_str()
+                    ))
+                }),
+            Err(e) => Err(format!(
+                "Failed to load exchange info for {}: {e}",
+                market.as_str()
+            )),
+        };
+        let (spec, symbol_spec_ready, startup_error) = match startup_spec {
+            Ok(spec) => (spec, true, None),
+            Err(message) => (client::SymbolSpec::default(), false, Some(message)),
+        };
 
         // Register all analytics windows. Adding a new window = one line here.
         let windows: Vec<Box<dyn AppWindow>> = vec![
@@ -118,9 +133,9 @@ impl App {
             show_spot_key_window: market == MarketType::Spot && !has_initial_spot_api_key,
             spot_key_message: (market == MarketType::Spot && !has_initial_spot_api_key)
                 .then(|| "Spot SBE requires an API key.".to_string()),
-            network_warning: None,
-            show_error_popup: false,
-            error_popup_message: None,
+            network_warning: startup_error.clone(),
+            show_error_popup: startup_error.is_some(),
+            error_popup_message: startup_error,
             pending_switch_after_key: false,
             rx,
             control_tx,
@@ -131,6 +146,7 @@ impl App {
             max_liquidity_usd: 100_000.0,
             price_prec: spec.price_prec,
             qty_prec: spec.qty_prec,
+            symbol_spec_ready,
             update_buffer: VecDeque::new(),
             ob_view: OrderBookView::default(),
             windows,
@@ -229,6 +245,7 @@ impl App {
         self.network_warning = None;
         self.show_error_popup = false;
         self.error_popup_message = None;
+        self.symbol_spec_ready = false;
         self.reset_all();
     }
 
@@ -358,6 +375,7 @@ impl eframe::App for App {
                     self.price_prec = spec.price_prec;
                     self.qty_prec = spec.qty_prec;
                     self.order_book.set_tick_size(spec.tick_size);
+                    self.symbol_spec_ready = true;
                 }
                 AppMessage::Snapshot {
                     symbol,
@@ -365,6 +383,9 @@ impl eframe::App for App {
                     snapshot,
                 } => {
                     if !self.message_matches_current(&symbol, market) {
+                        continue;
+                    }
+                    if !self.symbol_spec_ready {
                         continue;
                     }
                     // Book-only reset — analytics state (metrics, heatmap, TWAP)
@@ -382,6 +403,9 @@ impl eframe::App for App {
                     {
                         continue;
                     }
+                    if !self.symbol_spec_ready {
+                        continue;
+                    }
                     if self.order_book.last_applied_u == 0 {
                         self.update_buffer.push_back(update);
                     } else {
@@ -393,11 +417,17 @@ impl eframe::App for App {
                     {
                         continue;
                     }
+                    if !self.symbol_spec_ready {
+                        continue;
+                    }
                     self.on_trade(trade)
                 }
                 AppMessage::Ticker { market, ticker } => {
                     if market != self.market || !self.symbol_matches_current(ticker.symbol.as_str())
                     {
+                        continue;
+                    }
+                    if !self.symbol_spec_ready {
                         continue;
                     }
                     self.order_book.apply_ticker_anchor(ticker)
@@ -427,7 +457,11 @@ impl eframe::App for App {
                         Some(message)
                     };
                     if let Some(message) = &self.network_warning {
-                        if message.starts_with("Spot connection error:") {
+                        if message.starts_with("Spot connection error:")
+                            || message.starts_with("Exchange info")
+                            || message.starts_with("Failed to load exchange info")
+                            || message.starts_with("Symbol spec")
+                        {
                             self.error_popup_message = Some(message.clone());
                             self.show_error_popup = true;
                         }
