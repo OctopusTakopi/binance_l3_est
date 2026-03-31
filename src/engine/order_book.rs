@@ -8,6 +8,20 @@ type OrderQueue = VecDeque<f64>;
 type BookSide = BTreeMap<i64, (f64, OrderQueue)>;
 
 const QTY_EPSILON: f64 = 1e-12;
+const TRADE_BUFFER_WINDOW_MS: u64 = 10_000;
+
+#[derive(Clone)]
+struct BufferedTrade {
+    seq: u64,
+    trade: Trade,
+}
+
+#[derive(Clone, Copy)]
+struct TradeExpiryRef {
+    seq: u64,
+    price_ticks: i64,
+    transaction_time: u64,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum OrderBookError {
@@ -25,7 +39,9 @@ pub struct OrderBook {
     pub asks: BookSide,
     pub last_applied_u: u64,
     pub is_synced: bool,
-    pub trade_buffer: HashMap<i64, VecDeque<Trade>>,
+    trade_buffer: HashMap<i64, VecDeque<BufferedTrade>>,
+    trade_expiry_queue: VecDeque<TradeExpiryRef>,
+    next_trade_seq: u64,
     pub last_changes: Vec<LevelChangeResult>,
     pub cached_buy_points: Vec<PlotPoint>,
     pub cached_sell_points: Vec<PlotPoint>,
@@ -53,6 +69,8 @@ impl OrderBook {
             last_applied_u: 0,
             is_synced: false,
             trade_buffer: HashMap::with_capacity(100),
+            trade_expiry_queue: VecDeque::with_capacity(100),
+            next_trade_seq: 0,
             last_changes: Vec::with_capacity(40),
             cached_buy_points: Vec::new(),
             cached_sell_points: Vec::new(),
@@ -86,6 +104,8 @@ impl OrderBook {
         self.asks.clear();
         self.clear_top_of_book_cache();
         self.trade_buffer.clear();
+        self.trade_expiry_queue.clear();
+        self.next_trade_seq = 0;
         self.last_changes.clear();
         self.cached_buy_points.clear();
         self.cached_sell_points.clear();
@@ -117,6 +137,8 @@ impl OrderBook {
         self.last_applied_u = 0;
         self.is_synced = false;
         self.trade_buffer.clear();
+        self.trade_expiry_queue.clear();
+        self.next_trade_seq = 0;
         self.last_changes.clear();
         self.cached_buy_points.clear();
         self.cached_sell_points.clear();
@@ -356,9 +378,11 @@ impl OrderBook {
                 };
             } else if new_total_qty < old_total - QTY_EPSILON {
                 let mut remaining_to_remove = old_total - new_total_qty;
+                let mut remove_trade_bucket = false;
 
                 if let Some(trade_deq) = self.trade_buffer.get_mut(&price_ticks) {
-                    while let Some(trade) = trade_deq.front_mut() {
+                    while let Some(buffered_trade) = trade_deq.front_mut() {
+                        let trade = &mut buffered_trade.trade;
                         if ts >= trade.transaction_time && ts - trade.transaction_time < 1000 {
                             let trade_qty = trade.quantity;
                             if !queue.is_empty() && queue[0] < trade_qty {
@@ -395,6 +419,26 @@ impl OrderBook {
                             trade_deq.pop_front();
                         }
                     }
+                    remove_trade_bucket = trade_deq.is_empty();
+                }
+                if remove_trade_bucket {
+                    self.trade_buffer.remove(&price_ticks);
+                }
+
+                if remaining_to_remove <= QTY_EPSILON {
+                    if new_total_qty <= QTY_EPSILON {
+                        side.remove(&price_ticks);
+                    } else {
+                        *total_qty = new_total_qty;
+                    }
+
+                    return LevelChangeResult {
+                        inflow: 0.0,
+                        cancel: 0.0,
+                        is_tob,
+                        in_top20,
+                        is_bid,
+                    };
                 }
 
                 if remaining_to_remove > QTY_EPSILON {
@@ -422,6 +466,10 @@ impl OrderBook {
                         side.remove(&price_ticks);
                     } else {
                         *total_qty = new_total_qty;
+                        debug_assert!(
+                            (queue.iter().sum::<f64>() - *total_qty).abs() <= QTY_EPSILON,
+                            "queue total diverged from level total"
+                        );
                     }
 
                     return LevelChangeResult {
@@ -458,20 +506,21 @@ impl OrderBook {
 
     pub fn record_trade(&mut self, trade: &Trade) {
         let price_ticks = self.price_to_ticks(trade.price);
+        let seq = self.next_trade_seq;
+        self.next_trade_seq = self.next_trade_seq.wrapping_add(1);
         self.trade_buffer
             .entry(price_ticks)
             .or_default()
-            .push_back(trade.clone());
-        let now = trade.transaction_time;
-        for deq in self.trade_buffer.values_mut() {
-            while let Some(front) = deq.front() {
-                if now > front.transaction_time + 10_000 {
-                    deq.pop_front();
-                } else {
-                    break;
-                }
-            }
-        }
+            .push_back(BufferedTrade {
+                seq,
+                trade: trade.clone(),
+            });
+        self.trade_expiry_queue.push_back(TradeExpiryRef {
+            seq,
+            price_ticks,
+            transaction_time: trade.transaction_time,
+        });
+        self.expire_stale_trades(trade.transaction_time);
     }
 
     pub fn get_liquidity_curves(&mut self) -> (&[PlotPoint], &[PlotPoint]) {
@@ -666,6 +715,8 @@ impl OrderBook {
         self.bids.clear();
         self.asks.clear();
         self.trade_buffer.clear();
+        self.trade_expiry_queue.clear();
+        self.next_trade_seq = 0;
         self.last_changes.clear();
         self.cached_buy_points.clear();
         self.cached_sell_points.clear();
@@ -673,6 +724,32 @@ impl OrderBook {
         self.last_top_update_id = None;
         self.is_synced = false;
         self.clear_top_of_book_cache();
+    }
+
+    fn expire_stale_trades(&mut self, current_time: u64) {
+        while self
+            .trade_expiry_queue
+            .front()
+            .is_some_and(|entry| current_time > entry.transaction_time + TRADE_BUFFER_WINDOW_MS)
+        {
+            let expired = self
+                .trade_expiry_queue
+                .pop_front()
+                .expect("front expiry entry must exist");
+            let mut remove_bucket = false;
+            if let Some(trades) = self.trade_buffer.get_mut(&expired.price_ticks) {
+                if trades
+                    .front()
+                    .is_some_and(|buffered_trade| buffered_trade.seq == expired.seq)
+                {
+                    trades.pop_front();
+                }
+                remove_bucket = trades.is_empty();
+            }
+            if remove_bucket {
+                self.trade_buffer.remove(&expired.price_ticks);
+            }
+        }
     }
 }
 
@@ -719,6 +796,27 @@ mod tests {
 
     fn approx_eq(left: f64, right: f64) {
         assert!((left - right).abs() < 1e-9, "{left} != {right}");
+    }
+
+    fn trade(trade_id: u64, price: f64, quantity: f64, transaction_time: u64) -> Trade {
+        Trade {
+            event_type: "trade".to_string(),
+            event_time: transaction_time,
+            symbol: SymbolStr::from("BTCUSDT"),
+            trade_id,
+            price,
+            quantity,
+            order_type: "MARKET".to_string(),
+            transaction_time,
+            is_buyer_maker: true,
+        }
+    }
+
+    fn buffered_trade(seq: u64, price: f64, quantity: f64, transaction_time: u64) -> BufferedTrade {
+        BufferedTrade {
+            seq,
+            trade: trade(seq, price, quantity, transaction_time),
+        }
     }
 
     #[test]
@@ -931,5 +1029,55 @@ mod tests {
 
         assert_eq!(res, Ok(DepthUpdateStatus::Applied));
         assert!(ob.best_bid_ask().is_none());
+    }
+
+    #[test]
+    fn matched_trade_fully_consuming_level_removes_level_and_preserves_residual_trade() {
+        let mut ob = OrderBook::new(1.0);
+        let price_ticks = 100;
+
+        ob.bids
+            .insert(price_ticks, (0.5, VecDeque::from([0.2, 0.3])));
+        ob.trade_buffer.insert(
+            price_ticks,
+            VecDeque::from([buffered_trade(1, 100.0, 1.0, 100)]),
+        );
+
+        let result = ob.process_level_change(price_ticks, 0.0, true, 150, 0.0);
+
+        assert_eq!(result.inflow, 0.0);
+        assert_eq!(result.cancel, 0.0);
+        assert!(!ob.bids.contains_key(&price_ticks));
+
+        let trade = ob
+            .trade_buffer
+            .get(&price_ticks)
+            .and_then(|trades| trades.front().map(|trade| &trade.trade))
+            .expect("residual trade should remain buffered");
+        approx_eq(trade.quantity, 0.5);
+    }
+
+    #[test]
+    fn record_trade_expires_only_stale_front_entries() {
+        let mut ob = OrderBook::new(1.0);
+
+        ob.record_trade(&trade(1, 100.0, 1.0, 100));
+        ob.record_trade(&trade(2, 101.0, 1.0, 150));
+        ob.record_trade(&trade(3, 102.0, 1.0, 10_101));
+
+        assert!(!ob.trade_buffer.contains_key(&100));
+        assert_eq!(
+            ob.trade_buffer
+                .get(&101)
+                .and_then(|trades| trades.front().map(|trade| trade.trade.trade_id)),
+            Some(2)
+        );
+        assert_eq!(
+            ob.trade_buffer
+                .get(&102)
+                .and_then(|trades| trades.front().map(|trade| trade.trade.trade_id)),
+            Some(3)
+        );
+        assert_eq!(ob.trade_expiry_queue.len(), 2);
     }
 }
