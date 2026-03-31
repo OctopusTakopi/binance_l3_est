@@ -1,8 +1,8 @@
-# BINANCE PERP L3 Order Book Estimator
+# BINANCE L3 Order Book Estimator
 
 ![Demo GIF](demo2.gif)
 
-This project is a high-performance real-time visualization tool for the Binance perpetual swap order book. It estimates a Level 3 (L3) order book from Level 2 (L2) data streams to give you deep insights into market liquidity, order queue seniority, and participant behavior.
+This project is a high-performance real-time visualization tool for the Binance order book. It estimates a Level 3 (L3) order book from Level 2 (L2) data streams to give you deep insights into market liquidity, order queue seniority, and participant behavior.
 
 ## Key Features
 
