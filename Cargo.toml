@@ -1,6 +1,6 @@
 [package]
 name = "binance_l3_est"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["OctopusTakopi"]
 repository = "https://github.com/OctopusTakopi/binance_l3_est"
@@ -9,8 +9,12 @@ license = "MIT"
 keywords = ["order book", "binance", "trading", "hft", "visualization"]
 
 [dependencies]
-eframe = { version = "0.32.0", features = ["wgpu", "glow", "wayland", "x11"] }
+# wayland/x11 features are linux-only and live in the target block below.
+eframe = { version = "0.32.0", features = ["wgpu", "glow"] }
 wgpu = { version = "25.0", features = ["vulkan", "vulkan-portability"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.32.0", features = ["wayland", "x11"] }
 egui = { version = "0.32.0", features = ["default"] }
 jiff = { version = "0.2", features = ["serde"] }
 smallstr = { version = "0.3", features = ["serde", "std"] }

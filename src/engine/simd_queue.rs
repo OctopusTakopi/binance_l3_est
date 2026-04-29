@@ -1,3 +1,4 @@
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 pub const NULL_BLOCK: u32 = u32::MAX;
@@ -234,12 +235,22 @@ impl QueuePtrs {
         }
     }
 
+    /// Find an order whose size exactly matches `target_size` and zero it in
+    /// place. Returns `true` if a match was found.
+    ///
+    /// On x86_64 this uses an AVX2 + BMI1 vector compare; on other
+    /// architectures it walks the queue scalarly. The `unsafe` qualifier is
+    /// kept on every target for signature parity (the SIMD path requires
+    /// AVX2/BMI1 at runtime).
+    ///
     /// # Safety
     ///
-    /// The CPU must support the AVX2 + BMI1 target features (this fn is gated by
-    /// `#[target_feature]` and can only be called on hardware where those flags
-    /// are present). The caller is also responsible for not aliasing `pool`
-    /// elsewhere for the duration of the call.
+    /// On x86_64 the CPU must support the AVX2 + BMI1 target features (the fn
+    /// is gated by `#[target_feature]` and can only be called on hardware
+    /// where those flags are present). On all targets the caller is
+    /// responsible for not aliasing `pool` elsewhere for the duration of the
+    /// call.
+    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1")]
     pub unsafe fn remove_order_by_size_simd(
         &self,
@@ -276,6 +287,38 @@ impl QueuePtrs {
                 }
             }
 
+            if curr_block_idx == self.tail_block {
+                break;
+            }
+            curr_block_idx = block.next_block_idx;
+        }
+        false
+    }
+
+    /// Scalar fallback for non-x86_64 targets. Same contract as the SIMD
+    /// version above.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub unsafe fn remove_order_by_size_simd(
+        &self,
+        pool: &mut GlobalOrderPool,
+        target_size: u64,
+    ) -> bool {
+        let mut curr_block_idx = self.head_block;
+        while curr_block_idx != NULL_BLOCK {
+            let block = pool.get_block_mut(curr_block_idx);
+            for i in 0u32..4 {
+                if curr_block_idx == self.head_block && i < self.head_offset {
+                    continue;
+                }
+                if curr_block_idx == self.tail_block && i >= self.tail_offset {
+                    continue;
+                }
+                let slot = &mut block.sizes[i as usize];
+                if *slot > 0 && *slot == target_size {
+                    *slot = 0;
+                    return true;
+                }
+            }
             if curr_block_idx == self.tail_block {
                 break;
             }
