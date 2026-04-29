@@ -7,11 +7,25 @@ use egui_plot::{Bar, BarChart, Line, Plot, PlotPoint, PlotPoints, Text};
 
 pub struct TwapView {
     open: bool,
+    cached_bars_buy: Vec<Bar>,
+    cached_bars_sell: Vec<Bar>,
+    last_psd_len_buy: usize,
+    last_psd_len_sell: usize,
+    last_peaks_len_buy: usize,
+    last_peaks_len_sell: usize,
 }
 
 impl Default for TwapView {
     fn default() -> Self {
-        Self { open: false }
+        Self {
+            open: false,
+            cached_bars_buy: Vec::new(),
+            cached_bars_sell: Vec::new(),
+            last_psd_len_buy: 0,
+            last_psd_len_sell: 0,
+            last_peaks_len_buy: 0,
+            last_peaks_len_sell: 0,
+        }
     }
 }
 
@@ -76,11 +90,17 @@ impl AppWindow for TwapView {
                 }
 
                 if !twap.psd_buy.is_empty() {
-                    render_psd(
+                    if twap.psd_buy.len() != self.last_psd_len_buy || twap.peaks_buy.len() != self.last_peaks_len_buy {
+                        self.cached_bars_buy = build_psd_bars(&twap.psd_buy, &twap.peaks_buy, Color32::from_rgb(60, 140, 255));
+                        self.last_psd_len_buy = twap.psd_buy.len();
+                        self.last_peaks_len_buy = twap.peaks_buy.len();
+                    }
+
+                    render_psd_cached(
                         ui,
                         "twap_psd_buy",
                         "Taker Buy TWAP (Lifts Ask)",
-                        Color32::from_rgb(60, 140, 255),
+                        &self.cached_bars_buy,
                         &twap.psd_buy,
                         &twap.psd_vol_buy,
                         &twap.peaks_buy,
@@ -91,11 +111,17 @@ impl AppWindow for TwapView {
                 ui.separator();
 
                 if !twap.psd_sell.is_empty() {
-                    render_psd(
+                    if twap.psd_sell.len() != self.last_psd_len_sell || twap.peaks_sell.len() != self.last_peaks_len_sell {
+                        self.cached_bars_sell = build_psd_bars(&twap.psd_sell, &twap.peaks_sell, Color32::from_rgb(220, 80, 80));
+                        self.last_psd_len_sell = twap.psd_sell.len();
+                        self.last_peaks_len_sell = twap.peaks_sell.len();
+                    }
+
+                    render_psd_cached(
                         ui,
                         "twap_psd_sell",
                         "Taker Sell TWAP (Hits Bid)",
-                        Color32::from_rgb(220, 80, 80),
+                        &self.cached_bars_sell,
                         &twap.psd_sell,
                         &twap.psd_vol_sell,
                         &twap.peaks_sell,
@@ -116,27 +142,14 @@ impl AppWindow for TwapView {
     }
 }
 
-/// Render a single PSD bar chart with peak markers and detected-period labels.
-#[allow(clippy::too_many_arguments)]
-fn render_psd(
-    ui: &mut egui::Ui,
-    plot_id: &str,
-    label: &str,
-    color_normal: Color32,
-    psd: &[[f64; 2]],
-    psd_vol: &[[f64; 2]],
-    peaks: &[(f64, f64)],
-    n_bins: usize,
-) {
-    let max_power = psd.iter().map(|p| p[1]).fold(0.0_f64, f64::max);
+fn build_psd_bars(psd: &[[f64; 2]], peaks: &[(f64, f64)], color_normal: Color32) -> Vec<Bar> {
     let bar_width = if psd.len() > 1 {
         (psd[1][0] - psd[0][0]) * 0.8
     } else {
         0.001
     };
 
-    let bars: Vec<Bar> = psd
-        .iter()
+    psd.iter()
         .map(|p| {
             let is_peak = peaks.iter().any(|(fp, _)| (p[0] - fp).abs() < bar_width);
             let color = if is_peak {
@@ -146,7 +159,21 @@ fn render_psd(
             };
             Bar::new(p[0], p[1]).fill(color).width(bar_width)
         })
-        .collect();
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_psd_cached(
+    ui: &mut egui::Ui,
+    plot_id: &str,
+    label: &str,
+    bars: &[Bar],
+    psd: &[[f64; 2]],
+    psd_vol: &[[f64; 2]],
+    peaks: &[(f64, f64)],
+    n_bins: usize,
+) {
+    let max_power = psd.iter().map(|p| p[1]).fold(0.0_f64, f64::max);
 
     ui.label(label);
     ui.allocate_ui(egui::Vec2::new(570.0, 200.0), |ui| {
@@ -158,7 +185,7 @@ fn render_psd(
             .allow_scroll(false)
             .allow_zoom(false)
             .show(ui, |plot_ui| {
-                plot_ui.bar_chart(BarChart::new(plot_id, bars));
+                plot_ui.bar_chart(BarChart::new(plot_id, bars.to_vec()));
                 for (freq, _) in peaks {
                     let period = 1.0 / freq;
                     let lbl = format!("T={period:.1}s");

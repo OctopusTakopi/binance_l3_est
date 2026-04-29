@@ -9,12 +9,12 @@ license = "MIT"
 keywords = ["order book", "binance", "trading", "hft", "visualization"]
 
 [dependencies]
-eframe = "0.32.0"
+eframe = { version = "0.32.0", features = ["wgpu"] }
 egui = { version = "0.32.0", features = ["default"] }
 jiff = { version = "0.2", features = ["serde"] }
 smallstr = { version = "0.3", features = ["serde", "std"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1.46", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 tungstenite = { version = "0.27", features = ["native-tls"] }
@@ -35,3 +35,19 @@ num-complex = "0.4"
 thiserror = "2"
 anyhow = "1"
 zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "order_book_bench"
+harness = false
+
+[[bench]]
+name = "order_book_update_bench"
+harness = false
+
+[[bench]]
+name = "order_book_comparison"
+harness = false
+

@@ -24,7 +24,7 @@ pub struct Filter {
     pub step_size: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct OrderBookSnapshot {
     #[serde(rename = "lastUpdateId")]
     pub last_update_id: u64,

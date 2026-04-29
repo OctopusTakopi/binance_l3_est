@@ -1,12 +1,17 @@
 //! Heatmap window: depth-time visualisation.
 
 use crate::ui::window::{AppState, AppWindow};
-use eframe::egui::{self, Color32, TextureOptions};
+use eframe::egui::{self, Color32, TextureOptions, TextureHandle};
 
 pub struct HeatmapView {
     open: bool,
     pub contrast: f64,
     auto_scaled: bool,
+    
+    // Caching for performance
+    cached_texture: Option<TextureHandle>,
+    last_update_id: u64,
+    last_contrast: f64,
 }
 
 impl Default for HeatmapView {
@@ -15,6 +20,9 @@ impl Default for HeatmapView {
             open: true,
             contrast: 4.0,
             auto_scaled: false,
+            cached_texture: None,
+            last_update_id: u64::MAX,
+            last_contrast: 0.0,
         }
     }
 }
@@ -71,42 +79,47 @@ impl AppWindow for HeatmapView {
                     return;
                 }
 
-                let width = hm.data.len();
-                let height = hm.height;
-                let contrast = self.contrast;
-                let mut pixels = vec![Color32::BLACK; width * height];
+                if self.last_update_id != hm.last_update_id || (self.contrast - self.last_contrast).abs() > 0.01 {
+                    let width = hm.data.len();
+                    let height = hm.height;
+                    let contrast = self.contrast;
+                    let mut pixels = vec![Color32::BLACK; width * height];
 
-                for (col, snapshot) in hm.data.iter().enumerate() {
-                    for (row, &value) in snapshot.iter().enumerate() {
-                        let abs_val = value.abs();
-                        let z = if value != 0.0 { abs_val - 10.0 } else { -999.0 };
-                        if z < -1.0 {
-                            continue; // BLACK background
+                    for (col, snapshot) in hm.data.iter().enumerate() {
+                        for (row, &value) in snapshot.iter().enumerate() {
+                            let abs_val = value.abs();
+                            let z = if value != 0.0 { abs_val - 10.0 } else { -999.0 };
+                            if z < -1.0 {
+                                continue; // BLACK background
+                            }
+                            let t = ((z + 1.0) / contrast).clamp(0.0, 1.0);
+                            let t_sq = t * t;
+                            let intensity = (t_sq * 255.0) as u8;
+                            let color = if value > 0.0 {
+                                let g_boost = ((t_sq - 0.5).max(0.0) * 2.0 * 255.0) as u8;
+                                Color32::from_rgb(intensity, g_boost, 0)
+                            } else {
+                                let g_boost =
+                                    ((t_sq - 0.3).max(0.0) * 1.5 * 255.0).clamp(0.0, 255.0) as u8;
+                                Color32::from_rgb(0, g_boost, intensity)
+                            };
+                            pixels[row * width + col] = color;
                         }
-                        let t = ((z + 1.0) / contrast).clamp(0.0, 1.0);
-                        let t_sq = t * t;
-                        let intensity = (t_sq * 255.0) as u8;
-                        let color = if value > 0.0 {
-                            let g_boost = ((t_sq - 0.5).max(0.0) * 2.0 * 255.0) as u8;
-                            Color32::from_rgb(intensity, g_boost, 0)
-                        } else {
-                            let g_boost =
-                                ((t_sq - 0.3).max(0.0) * 1.5 * 255.0).clamp(0.0, 255.0) as u8;
-                            Color32::from_rgb(0, g_boost, intensity)
-                        };
-                        pixels[row * width + col] = color;
                     }
+
+                    let color_image = egui::ColorImage {
+                        size: [width, height],
+                        source_size: Default::default(),
+                        pixels,
+                    };
+                    self.cached_texture = Some(ui.ctx().load_texture("heatmap", color_image, TextureOptions::LINEAR));
+                    self.last_update_id = hm.last_update_id;
+                    self.last_contrast = self.contrast;
                 }
 
-                let color_image = egui::ColorImage {
-                    size: [width, height],
-                    source_size: Default::default(),
-                    pixels,
-                };
-                let texture = ui
-                    .ctx()
-                    .load_texture("heatmap", color_image, TextureOptions::LINEAR);
-                ui.image(&texture);
+                if let Some(texture) = &self.cached_texture {
+                    ui.image(texture);
+                }
             });
     }
 }

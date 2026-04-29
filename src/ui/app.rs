@@ -16,7 +16,7 @@ use crate::ui::windows::{
 use eframe::egui;
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender as TokioSender};
 
-const MAX_APP_MESSAGES_PER_FRAME: usize = 2_000;
+// const MAX_APP_MESSAGES_PER_FRAME was removed
 
 // ── App struct ─────────────────────────────────────────────────────────────────
 
@@ -176,29 +176,6 @@ impl App {
         // Do NOT touch update_buffer — it is drained by the Snapshot handler.
     }
 
-    // ── Trade dispatch ─────────────────────────────────────────────────────────
-
-    fn on_trade(&mut self, trade: Trade) {
-        self.feature_engine.on_trade(&trade, &mut self.order_book);
-    }
-
-    // ── Depth update dispatch ──────────────────────────────────────────────────
-
-    fn on_depth_update(&mut self, update: crate::types::DepthUpdate) {
-        use crate::engine::order_book::OrderBookError;
-
-        let res = self
-            .feature_engine
-            .on_depth_update(update, &mut self.order_book);
-
-        if let Err(OrderBookError::SequenceGap) = res {
-            self.order_book.is_synced = false;
-            self.update_buffer.clear();
-            let _ = self.control_tx.send(Control::Refetch);
-            return;
-        }
-    }
-
     fn symbol_matches_current(&self, symbol: &str) -> bool {
         symbol.eq_ignore_ascii_case(&self.symbol)
     }
@@ -348,8 +325,8 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── 1. Periodic metrics sampling ──────────────────────────────────────
         self.metrics_timer += 1;
-        // Sample once warmup finished (30 depth-update batches ≈ 300 raw updates)
-        if self.metrics_timer % 10 == 0 && self.feature_engine.warmup_samples >= 30 {
+        // Sample every 50 frames (approx every 650ms at 75 FPS)
+        if self.metrics_timer % 50 == 0 && self.feature_engine.warmup_samples >= 30 {
             let now = ctx.input(|i| i.time);
             self.feature_engine.metrics.sample(now);
             self.feature_engine.metrics.prune(now - 200.0);
@@ -357,7 +334,7 @@ impl eframe::App for App {
 
         // ── 2. Drain incoming messages ────────────────────────────────────────
         let mut processed_messages = 0usize;
-        while processed_messages < MAX_APP_MESSAGES_PER_FRAME {
+        while processed_messages < 5000 {
             let Ok(msg) = self.rx.try_recv() else {
                 break;
             };
@@ -376,117 +353,61 @@ impl eframe::App for App {
                     self.qty_prec = spec.qty_prec;
                     self.order_book.set_tick_size(spec.tick_size);
                     self.symbol_spec_ready = true;
-                    if self.network_warning.as_deref().is_some_and(|message| {
-                        message.starts_with("Exchange info")
-                            || message.starts_with("Failed to load exchange info")
-                            || message.starts_with("Symbol spec")
-                    }) {
-                        self.network_warning = None;
-                        self.show_error_popup = false;
-                        self.error_popup_message = None;
-                    }
+                    self.network_warning = None;
+                    self.show_error_popup = false;
                 }
                 AppMessage::Snapshot {
                     symbol,
                     market,
                     snapshot,
                 } => {
-                    if !self.message_matches_current(&symbol, market) {
+                    if !self.message_matches_current(&symbol, market) || !self.symbol_spec_ready {
                         continue;
                     }
-                    if !self.symbol_spec_ready {
-                        continue;
-                    }
-                    // Book-only reset — analytics state (metrics, heatmap, TWAP)
-                    // is preserved so a routine refetch does not flush the plots.
-                    self.show_error_popup = false;
-                    self.error_popup_message = None;
                     self.reset_book_only();
                     self.order_book.apply_snapshot(snapshot);
                     while let Some(update) = self.update_buffer.pop_front() {
-                        self.on_depth_update(update);
+                        let _ = self.feature_engine.on_depth_update(update, &mut self.order_book);
                     }
                 }
                 AppMessage::Update { market, update } => {
-                    if market != self.market || !self.symbol_matches_current(update.symbol.as_str())
-                    {
-                        continue;
-                    }
-                    if !self.symbol_spec_ready {
+                    if market != self.market || !self.symbol_matches_current(update.symbol.as_str()) || !self.symbol_spec_ready {
                         continue;
                     }
                     if self.order_book.last_applied_u == 0 {
                         self.update_buffer.push_back(update);
                     } else {
-                        self.on_depth_update(update);
+                        let res = self.feature_engine.on_depth_update(update, &mut self.order_book);
+                        if let Err(crate::engine::order_book::OrderBookError::SequenceGap) = res {
+                            self.order_book.is_synced = false;
+                            self.update_buffer.clear();
+                            let _ = self.control_tx.send(Control::Refetch);
+                        }
                     }
                 }
                 AppMessage::Trade { market, trade } => {
-                    if market != self.market || !self.symbol_matches_current(trade.symbol.as_str())
-                    {
+                    if market != self.market || !self.symbol_matches_current(trade.symbol.as_str()) || !self.symbol_spec_ready {
                         continue;
                     }
-                    if !self.symbol_spec_ready {
-                        continue;
-                    }
-                    self.on_trade(trade)
+                    self.feature_engine.on_trade(&trade, &mut self.order_book);
                 }
                 AppMessage::Ticker { market, ticker } => {
-                    if market != self.market || !self.symbol_matches_current(ticker.symbol.as_str())
-                    {
+                    if market != self.market || !self.symbol_matches_current(ticker.symbol.as_str()) || !self.symbol_spec_ready {
                         continue;
                     }
-                    if !self.symbol_spec_ready {
-                        continue;
-                    }
-                    self.order_book.apply_ticker_anchor(ticker)
+                    self.order_book.apply_ticker_anchor(ticker);
                 }
-                AppMessage::SpotApiKeyRequired {
-                    symbol,
-                    market,
-                    message,
-                } => {
-                    if !self.message_matches_current(&symbol, market) {
-                        continue;
-                    }
+                AppMessage::SpotApiKeyRequired { message, .. } => {
                     self.spot_key_message = Some(message);
                     self.show_spot_key_window = true;
                 }
-                AppMessage::NetworkWarning {
-                    symbol,
-                    market,
-                    message,
-                } => {
-                    if !self.message_matches_current(&symbol, market) {
-                        continue;
-                    }
-                    self.network_warning = if message.trim().is_empty() {
-                        None
-                    } else {
-                        Some(message)
-                    };
-                    if let Some(message) = &self.network_warning {
-                        if message.starts_with("Spot connection error:")
-                            || message.starts_with("Exchange info")
-                            || message.starts_with("Failed to load exchange info")
-                            || message.starts_with("Symbol spec")
-                        {
-                            self.error_popup_message = Some(message.clone());
-                            self.show_error_popup = true;
-                        }
-                    } else {
-                        self.error_popup_message = None;
-                        self.show_error_popup = false;
-                    }
+                AppMessage::NetworkWarning { message, .. } => {
+                    self.network_warning = Some(message);
                 }
             }
         }
 
-        if processed_messages == MAX_APP_MESSAGES_PER_FRAME {
-            // Spot SBE can outpace egui if we drain indefinitely here.
-            // Yield to rendering and continue draining on the next frame.
-            ctx.request_repaint();
-        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         // ── 3. Central panel ──────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {

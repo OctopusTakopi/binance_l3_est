@@ -73,7 +73,7 @@ impl MarketType {
 #[derive(Deserialize)]
 struct CombinedStream {
     stream: String,
-    data: serde_json::Value,
+    data: Box<serde_json::value::RawValue>,
 }
 
 fn symbol_cache_key(market: MarketType, symbol: &str) -> String {
@@ -481,6 +481,9 @@ async fn connect_futures_json(
     let depth_suffix = endpoints.depth_stream.to_string();
     let ticker_suffix = endpoints.ticker_stream.to_string();
     let market = MarketType::Futures;
+    let mut last_repaint = std::time::Instant::now();
+    let repaint_interval = std::time::Duration::from_millis(13); // ~75 FPS
+
     Ok(tokio::spawn(async move {
         while let Some(result) = ws_stream.next().await {
             match result {
@@ -489,23 +492,30 @@ async fn connect_futures_json(
                         continue;
                     };
 
+                    let mut needs_repaint = false;
+                    
                     if combined.stream.ends_with(&depth_suffix) {
-                        if let Ok(update) = serde_json::from_value::<DepthUpdate>(combined.data) {
+                        if let Ok(update) = serde_json::from_str::<DepthUpdate>(combined.data.get()) {
                             let _ = tx_clone.send(AppMessage::Update { market, update });
-                            ctx_clone.request_repaint();
+                            needs_repaint = true;
                         }
                     } else if combined.stream.ends_with("@trade") {
-                        if let Ok(trade) = serde_json::from_value::<Trade>(combined.data) {
+                        if let Ok(trade) = serde_json::from_str::<Trade>(combined.data.get()) {
                             if trade.order_type != "NA" && trade.price > 0.0 {
                                 let _ = tx_clone.send(AppMessage::Trade { market, trade });
-                                ctx_clone.request_repaint();
+                                needs_repaint = true;
                             }
                         }
                     } else if combined.stream.ends_with(&ticker_suffix) {
-                        if let Ok(ticker) = serde_json::from_value::<BookTicker>(combined.data) {
+                        if let Ok(ticker) = serde_json::from_str::<BookTicker>(combined.data.get()) {
                             let _ = tx_clone.send(AppMessage::Ticker { market, ticker });
-                            ctx_clone.request_repaint();
+                            needs_repaint = true;
                         }
+                    }
+
+                    if needs_repaint && last_repaint.elapsed() > repaint_interval {
+                        ctx_clone.request_repaint();
+                        last_repaint = std::time::Instant::now();
                     }
                 }
                 Ok(WsMessage::Ping(payload)) => {
@@ -554,6 +564,9 @@ async fn connect_spot_sbe(
     let tx_clone = tx.clone();
     let ctx_clone = ctx.clone();
     let market = MarketType::Spot;
+    let mut last_repaint = std::time::Instant::now();
+    let repaint_interval = std::time::Duration::from_millis(13); // ~75 FPS
+
     Ok(tokio::spawn(async move {
         while let Some(result) = ws_stream.next().await {
             match result {
@@ -562,15 +575,24 @@ async fn connect_spot_sbe(
                         for trade in trades {
                             let _ = tx_clone.send(AppMessage::Trade { market, trade });
                         }
-                        ctx_clone.request_repaint();
+                        if last_repaint.elapsed() > repaint_interval {
+                            ctx_clone.request_repaint();
+                            last_repaint = std::time::Instant::now();
+                        }
                     }
                     Some(SpotSbeEvent::BestBidAsk(ticker)) => {
                         let _ = tx_clone.send(AppMessage::Ticker { market, ticker });
-                        ctx_clone.request_repaint();
+                        if last_repaint.elapsed() > repaint_interval {
+                            ctx_clone.request_repaint();
+                            last_repaint = std::time::Instant::now();
+                        }
                     }
                     Some(SpotSbeEvent::DepthDiff(update)) => {
                         let _ = tx_clone.send(AppMessage::Update { market, update });
-                        ctx_clone.request_repaint();
+                        if last_repaint.elapsed() > repaint_interval {
+                            ctx_clone.request_repaint();
+                            last_repaint = std::time::Instant::now();
+                        }
                     }
                     None => {}
                 },
