@@ -1,10 +1,7 @@
-use crate::engine::simd_queue::{GlobalOrderPool, QueuePtrs, NULL_BLOCK};
-use std::arch::x86_64::*;
+use crate::engine::simd_queue::{GlobalOrderPool, NULL_BLOCK, QueuePtrs};
 
 pub const WINDOW_SIZE: usize = 1 << 16; // 65536 ticks
-pub const WINDOW_MASK: usize = WINDOW_SIZE - 1;
 pub const QTY_MULTIPLIER: f64 = 1e8;
-pub const QTY_EPSILON_U64: u64 = 1;
 
 /// Hierarchical bitset for fast BBO discovery.
 #[derive(Clone)]
@@ -12,6 +9,12 @@ pub struct Bitset {
     pub l2: [u64; 1024],
     pub l1: [u64; 16],
     pub l0: u64,
+}
+
+impl Default for Bitset {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bitset {
@@ -55,7 +58,9 @@ impl Bitset {
 
     #[inline(always)]
     pub fn find_first(&self) -> Option<usize> {
-        if self.l0 == 0 { return None; }
+        if self.l0 == 0 {
+            return None;
+        }
         let i1 = self.l0.trailing_zeros() as usize;
         let i2_base = self.l1[i1].trailing_zeros() as usize;
         let i2 = (i1 << 6) + i2_base;
@@ -65,7 +70,9 @@ impl Bitset {
 
     #[inline(always)]
     pub fn find_last(&self) -> Option<usize> {
-        if self.l0 == 0 { return None; }
+        if self.l0 == 0 {
+            return None;
+        }
         let i1 = 63 - self.l0.leading_zeros() as usize;
         let i2_base = 63 - self.l1[i1].leading_zeros() as usize;
         let i2 = (i1 << 6) + i2_base;
@@ -75,28 +82,32 @@ impl Bitset {
 
     #[inline(always)]
     pub fn is_set(&self, idx: usize) -> bool {
-        if idx >= WINDOW_SIZE { return false; }
+        if idx >= WINDOW_SIZE {
+            return false;
+        }
         let i2 = idx >> 6;
         (self.l2[i2] & (1u64 << (idx & 63))) != 0
     }
 
     #[inline(always)]
     pub fn find_next(&self, start_idx: usize) -> Option<usize> {
-        if start_idx >= WINDOW_SIZE { return None; }
-        
+        if start_idx >= WINDOW_SIZE {
+            return None;
+        }
+
         let i2_idx = start_idx >> 6;
         let bit_in_i2 = start_idx & 63;
-        
+
         // 1. Check current L2 word
         let word2 = self.l2[i2_idx] & (!0u64 << bit_in_i2);
         if word2 != 0 {
             return Some((i2_idx << 6) + word2.trailing_zeros() as usize);
         }
-        
+
         // 2. Search hierarchy
         let i1_idx = i2_idx >> 6;
         let bit_in_i1 = i2_idx & 63;
-        
+
         // Next words in current L1
         if bit_in_i1 < 63 {
             let word1 = self.l1[i1_idx] & (!0u64 << (bit_in_i1 + 1));
@@ -105,7 +116,7 @@ impl Bitset {
                 return Some((next_i2 << 6) + self.l2[next_i2].trailing_zeros() as usize);
             }
         }
-        
+
         // Next blocks in L0
         if i1_idx < 15 {
             let word0 = self.l0 & (!0u64 << (i1_idx + 1));
@@ -116,7 +127,7 @@ impl Bitset {
                 return Some((next_i2 << 6) + self.l2[next_i2].trailing_zeros() as usize);
             }
         }
-        
+
         None
     }
 
@@ -127,18 +138,22 @@ impl Bitset {
         }
         let i2_idx = start_idx >> 6;
         let bit_in_i2 = start_idx & 63;
-        
+
         // 1. Check current L2 word
-        let mask2 = if bit_in_i2 == 63 { !0u64 } else { (1u64 << (bit_in_i2 + 1)) - 1 };
+        let mask2 = if bit_in_i2 == 63 {
+            !0u64
+        } else {
+            (1u64 << (bit_in_i2 + 1)) - 1
+        };
         let word2 = self.l2[i2_idx] & mask2;
         if word2 != 0 {
             return Some((i2_idx << 6) + 63 - (word2.leading_zeros() as usize));
         }
-        
+
         // 2. Search hierarchy
         let i1_idx = i2_idx >> 6;
         let bit_in_i1 = i2_idx & 63;
-        
+
         // Previous words in current L1
         if bit_in_i1 > 0 {
             let mask1 = (1u64 << bit_in_i1) - 1;
@@ -148,7 +163,7 @@ impl Bitset {
                 return Some((prev_i2 << 6) + 63 - (self.l2[prev_i2].leading_zeros() as usize));
             }
         }
-        
+
         // Previous blocks in L0
         if i1_idx > 0 {
             let mask0 = (1u64 << i1_idx) - 1;
@@ -160,7 +175,7 @@ impl Bitset {
                 return Some((prev_i2 << 6) + 63 - (self.l2[prev_i2].leading_zeros() as usize));
             }
         }
-        
+
         None
     }
 
@@ -292,7 +307,11 @@ impl FastOrderBook {
             }
             self.total_qtys[idx] = new_total_u64;
             if new_total_u64 == 0 {
-                if is_bid { self.bids_bitset.clear(idx); } else { self.asks_bitset.clear(idx); }
+                if is_bid {
+                    self.bids_bitset.clear(idx);
+                } else {
+                    self.asks_bitset.clear(idx);
+                }
                 self.clear_queue(idx);
             }
         }
@@ -319,14 +338,14 @@ impl FastOrderBook {
             return;
         }
 
-        let shift_abs = shift.abs() as usize;
+        let shift_abs = shift.unsigned_abs() as usize;
         if shift > 0 {
             for i in 0..shift_abs {
                 self.clear_queue(i);
             }
             self.total_qtys.rotate_left(shift_abs);
             self.queues.rotate_left(shift_abs);
-            
+
             for i in (WINDOW_SIZE - shift_abs)..WINDOW_SIZE {
                 self.total_qtys[i] = 0;
                 self.queues[i] = QueuePtrs::default();
@@ -365,7 +384,8 @@ impl FastOrderBook {
         } else {
             let inv_bit_shift = 64 - bit_shift;
             for i in 0..(1024 - u64_shift - 1) {
-                bs.l2[i] = (bs.l2[i + u64_shift] >> bit_shift) | (bs.l2[i + u64_shift + 1] << inv_bit_shift);
+                bs.l2[i] = (bs.l2[i + u64_shift] >> bit_shift)
+                    | (bs.l2[i + u64_shift + 1] << inv_bit_shift);
             }
             if 1024 > u64_shift {
                 bs.l2[1024 - u64_shift - 1] = bs.l2[1023] >> bit_shift;
@@ -383,7 +403,8 @@ impl FastOrderBook {
         } else {
             let inv_bit_shift = 64 - bit_shift;
             for i in (u64_shift + 1..1024).rev() {
-                bs.l2[i] = (bs.l2[i - u64_shift] << bit_shift) | (bs.l2[i - u64_shift - 1] >> inv_bit_shift);
+                bs.l2[i] = (bs.l2[i - u64_shift] << bit_shift)
+                    | (bs.l2[i - u64_shift - 1] >> inv_bit_shift);
             }
             bs.l2[u64_shift] = bs.l2[0] << bit_shift;
             bs.l2[..u64_shift].fill(0);
@@ -397,7 +418,9 @@ impl FastOrderBook {
             while curr != NULL_BLOCK {
                 let next = self.pool.get_block(curr).next_block_idx;
                 self.pool.free_block(curr);
-                if curr == q.tail_block { break; }
+                if curr == q.tail_block {
+                    break;
+                }
                 curr = next;
             }
             self.queues[idx] = QueuePtrs::default();
@@ -416,10 +439,14 @@ impl FastOrderBook {
     }
 
     pub fn best_bid(&self) -> Option<i64> {
-        self.bids_bitset.find_last().map(|idx| self.base_price_ticks + idx as i64)
+        self.bids_bitset
+            .find_last()
+            .map(|idx| self.base_price_ticks + idx as i64)
     }
 
     pub fn best_ask(&self) -> Option<i64> {
-        self.asks_bitset.find_first().map(|idx| self.base_price_ticks + idx as i64)
+        self.asks_bitset
+            .find_first()
+            .map(|idx| self.base_price_ticks + idx as i64)
     }
 }

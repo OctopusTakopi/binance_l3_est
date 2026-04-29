@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rand::{Rng, SeedableRng};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 use binance_l3_est::engine::order_book::OrderBook;
 use binance_l3_est::types::{DepthUpdate, OrderBookSnapshot};
@@ -49,7 +49,7 @@ fn generate_synthetic_data(
         for _ in 0..2 {
             let offset = rng.random_range(1..=500);
             let price = mid_price - (offset as f64) * tick_size;
-            let qty = rng.random_range(0.0..6.0); 
+            let qty = rng.random_range(0.0..6.0);
             b.push([price, qty]);
         }
 

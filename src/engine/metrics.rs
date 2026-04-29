@@ -258,7 +258,7 @@ fn safe_div(numerator: f64, denominator: f64) -> f64 {
 }
 
 fn prune_deque(deq: &mut VecDeque<PlotPoint>, limit: f64) {
-    while deq.front().map_or(false, |p| p.x < limit) {
+    while deq.front().is_some_and(|p| p.x < limit) {
         deq.pop_front();
     }
 }

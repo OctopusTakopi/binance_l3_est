@@ -56,9 +56,9 @@ impl HeatmapState {
     pub fn update_rolling_stats(&mut self, book: &OrderBook) {
         let mut count = 0_usize;
         let mut sum = 0.0;
-        
+
         let levels_per_side = self.height / 2;
-        
+
         // Use a single pass for mean and variance if possible, or just be efficient with iterators
         let bids = book.iter_bids().take(levels_per_side);
         let asks = book.iter_asks().take(levels_per_side);
@@ -98,10 +98,10 @@ impl HeatmapState {
 
     /// Compute and append a new column snapshot.
     pub fn append(&mut self, book: &OrderBook) {
-        // update_rolling_stats is called by FeatureEngine before append, 
+        // update_rolling_stats is called by FeatureEngine before append,
         // so we don't necessarily need to call it here again if we trust the caller.
         // But for safety:
-        // self.update_rolling_stats(book); 
+        // self.update_rolling_stats(book);
 
         let mean = self.rolling_mean_qty;
         let std = self.rolling_std_qty.max(1e-9);
@@ -127,7 +127,7 @@ impl HeatmapState {
             .snapshot_pool
             .pop()
             .unwrap_or_else(|| vec![0.0_f64; self.height]);
-        
+
         if snapshot.len() != self.height {
             snapshot.resize(self.height, 0.0);
         }
@@ -151,15 +151,17 @@ impl HeatmapState {
                 snapshot[i] = -((qty - mean) / std + 10.0);
             }
             i += 1;
-            if i >= self.height { break; }
+            if i >= self.height {
+                break;
+            }
         }
 
         self.data.push_back(snapshot);
         self.last_update_id = self.last_update_id.wrapping_add(1);
-        if self.data.len() > self.width {
-            if let Some(old_snapshot) = self.data.pop_front() {
-                self.snapshot_pool.push(old_snapshot);
-            }
+        if self.data.len() > self.width
+            && let Some(old_snapshot) = self.data.pop_front()
+        {
+            self.snapshot_pool.push(old_snapshot);
         }
     }
 }

@@ -38,7 +38,6 @@ pub struct MiniBatchKMeans {
     centroids_ready: bool,
     points: Vec<Point>,
     labels: Vec<usize>,
-    batch_indices: Vec<usize>,
     sort_buf: Vec<Point>,
 }
 
@@ -53,7 +52,6 @@ impl MiniBatchKMeans {
             centroids_ready: false,
             points: Vec::with_capacity(1024),
             labels: Vec::with_capacity(1024),
-            batch_indices: Vec::with_capacity(batch_size),
             sort_buf: Vec::with_capacity(1024),
         }
     }
@@ -103,7 +101,8 @@ impl MiniBatchKMeans {
             for i in 0..k {
                 if counts[i] > 0 {
                     let lr = 1.0 / counts[i] as f64;
-                    self.centroids[i].qty = (1.0 - lr) * self.centroids[i].qty + lr * (sums[i] / counts[i] as f64);
+                    self.centroids[i].qty =
+                        (1.0 - lr) * self.centroids[i].qty + lr * (sums[i] / counts[i] as f64);
                 }
             }
         }
@@ -114,9 +113,14 @@ impl MiniBatchKMeans {
         }
 
         let mut centroid_order = [0usize; MAX_K];
-        for i in 0..k { centroid_order[i] = i; }
+        for (i, slot) in centroid_order.iter_mut().take(k).enumerate() {
+            *slot = i;
+        }
         centroid_order[..k].sort_unstable_by(|&a, &b| {
-            self.centroids[a].qty.partial_cmp(&self.centroids[b].qty).unwrap_or(Ordering::Equal)
+            self.centroids[a]
+                .qty
+                .partial_cmp(&self.centroids[b].qty)
+                .unwrap_or(Ordering::Equal)
         });
         let mut label_map = [0usize; MAX_K];
         for (new_label, &old_label) in centroid_order[..k].iter().enumerate() {
@@ -145,7 +149,8 @@ impl MiniBatchKMeans {
     fn initialize_centroids(&mut self) {
         self.sort_buf.clear();
         self.sort_buf.extend_from_slice(&self.points);
-        self.sort_buf.sort_unstable_by(|a, b| a.qty.partial_cmp(&b.qty).unwrap_or(Ordering::Equal));
+        self.sort_buf
+            .sort_unstable_by(|a, b| a.qty.partial_cmp(&b.qty).unwrap_or(Ordering::Equal));
         let n = self.sort_buf.len();
         let k = self.num_clusters;
         let step = if k > 1 { (n - 1) / (k - 1) } else { 0 };
@@ -169,11 +174,9 @@ where
     for (price, order_iter) in iter {
         let mut level_orders = Vec::new();
         for qty in order_iter {
-            if qty > 0.0 {
-                if idx < labels.len() {
-                    level_orders.push((qty, labels[idx]));
-                    idx += 1;
-                }
+            if qty > 0.0 && idx < labels.len() {
+                level_orders.push((qty, labels[idx]));
+                idx += 1;
             }
         }
         out.push((price, level_orders));

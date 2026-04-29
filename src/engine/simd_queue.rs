@@ -7,9 +7,7 @@ pub const NULL_BLOCK: u32 = u32::MAX;
 pub struct OrderBlock {
     pub sizes: [u64; 4],
     pub next_block_idx: u32,
-    pub prev_block_idx: u32, // Added for O(1) pop_back
-    pub is_our_order_mask: u8,
-    pub _pad: [u8; 11], // Adjust padding to keep alignment
+    pub prev_block_idx: u32,
 }
 
 impl Default for OrderBlock {
@@ -18,8 +16,6 @@ impl Default for OrderBlock {
             sizes: [0; 4],
             next_block_idx: NULL_BLOCK,
             prev_block_idx: NULL_BLOCK,
-            is_our_order_mask: 0,
-            _pad: [0; 11],
         }
     }
 }
@@ -35,11 +31,6 @@ impl GlobalOrderPool {
             pool: Vec::with_capacity(capacity),
             free_head: NULL_BLOCK,
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.pool.clear();
-        self.free_head = NULL_BLOCK;
     }
 
     pub fn alloc_block(&mut self) -> u32 {
@@ -104,7 +95,8 @@ impl QueuePtrs {
     #[inline(always)]
     pub fn is_empty(&mut self, pool: &mut GlobalOrderPool) -> bool {
         self.first_size(pool);
-        self.head_block == NULL_BLOCK || (self.head_block == self.tail_block && self.head_offset == self.tail_offset)
+        self.head_block == NULL_BLOCK
+            || (self.head_block == self.tail_block && self.head_offset == self.tail_offset)
     }
 
     #[inline(always)]
@@ -131,20 +123,24 @@ impl QueuePtrs {
     pub fn first_size(&mut self, pool: &mut GlobalOrderPool) -> u64 {
         self.mut_first_size(pool, |_| {}).unwrap_or(0)
     }
-    
+
     #[inline(always)]
     pub fn mut_first_size<F>(&mut self, pool: &mut GlobalOrderPool, mut f: F) -> Option<u64>
-    where F: FnMut(&mut u64) {
+    where
+        F: FnMut(&mut u64),
+    {
         let mut curr_block = self.head_block;
         let mut curr_offset = self.head_offset;
 
-        while curr_block != NULL_BLOCK && !(curr_block == self.tail_block && curr_offset == self.tail_offset) {
+        while curr_block != NULL_BLOCK
+            && !(curr_block == self.tail_block && curr_offset == self.tail_offset)
+        {
             let size = pool.get_block(curr_block).sizes[curr_offset as usize];
             if size > 0 {
                 let mut sz = size;
                 f(&mut sz);
                 pool.get_block_mut(curr_block).sizes[curr_offset as usize] = sz;
-                
+
                 self.head_block = curr_block;
                 self.head_offset = curr_offset;
                 return Some(size);
@@ -172,7 +168,9 @@ impl QueuePtrs {
 
     #[inline(always)]
     pub fn pop_back(&mut self, pool: &mut GlobalOrderPool) -> Option<u64> {
-        while self.head_block != NULL_BLOCK && !(self.head_block == self.tail_block && self.head_offset == self.tail_offset) {
+        while self.head_block != NULL_BLOCK
+            && !(self.head_block == self.tail_block && self.head_offset == self.tail_offset)
+        {
             if self.tail_offset > 0 {
                 self.tail_offset -= 1;
                 let val = pool.get_block(self.tail_block).sizes[self.tail_offset as usize];
@@ -194,25 +192,6 @@ impl QueuePtrs {
         }
         None
     }
-
-    pub fn total_qty(&self, pool: &GlobalOrderPool) -> u64 {
-        let mut curr_block = self.head_block;
-        let mut curr_offset = self.head_offset;
-        let mut total = 0;
-
-        while curr_block != NULL_BLOCK && !(curr_block == self.tail_block && curr_offset == self.tail_offset) {
-            let size = pool.get_block(curr_block).sizes[curr_offset as usize];
-            if size > 0 {
-                total += size;
-            }
-            curr_offset += 1;
-            if curr_offset == 4 {
-                curr_block = pool.get_block(curr_block).next_block_idx;
-                curr_offset = 0;
-            }
-        }
-        total
-    }
 }
 
 pub struct QueueIter<'a> {
@@ -227,7 +206,9 @@ impl<'a> Iterator for QueueIter<'a> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.curr_block != NULL_BLOCK && !(self.curr_block == self.tail_block && self.curr_offset == self.tail_offset) {
+        while self.curr_block != NULL_BLOCK
+            && !(self.curr_block == self.tail_block && self.curr_offset == self.tail_offset)
+        {
             let size = self.pool.get_block(self.curr_block).sizes[self.curr_offset as usize];
             self.curr_offset += 1;
             if self.curr_offset == 4 {
@@ -253,8 +234,18 @@ impl QueuePtrs {
         }
     }
 
+    /// # Safety
+    ///
+    /// The CPU must support the AVX2 + BMI1 target features (this fn is gated by
+    /// `#[target_feature]` and can only be called on hardware where those flags
+    /// are present). The caller is also responsible for not aliasing `pool`
+    /// elsewhere for the duration of the call.
     #[target_feature(enable = "avx2,bmi1")]
-    pub unsafe fn remove_order_by_size_simd(&self, pool: &mut GlobalOrderPool, target_size: u64) -> bool {
+    pub unsafe fn remove_order_by_size_simd(
+        &self,
+        pool: &mut GlobalOrderPool,
+        target_size: u64,
+    ) -> bool {
         let mut curr_block_idx = self.head_block;
         let target_vec = _mm256_set1_epi64x(target_size as i64);
 
@@ -262,7 +253,7 @@ impl QueuePtrs {
             let block = pool.get_block_mut(curr_block_idx);
             let sizes_ptr = block.sizes.as_ptr() as *const __m256i;
             let sizes_vec = unsafe { _mm256_loadu_si256(sizes_ptr) };
-            
+
             let cmp_mask = _mm256_cmpeq_epi64(sizes_vec, target_vec);
             let match_bits = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_mask));
 
@@ -272,15 +263,19 @@ impl QueuePtrs {
                 bits &= bits - 1;
 
                 let mut valid = true;
-                if curr_block_idx == self.head_block && match_idx < self.head_offset { valid = false; }
-                if curr_block_idx == self.tail_block && match_idx >= self.tail_offset { valid = false; }
-                
+                if curr_block_idx == self.head_block && match_idx < self.head_offset {
+                    valid = false;
+                }
+                if curr_block_idx == self.tail_block && match_idx >= self.tail_offset {
+                    valid = false;
+                }
+
                 if valid && block.sizes[match_idx as usize] > 0 {
                     block.sizes[match_idx as usize] = 0;
                     return true;
                 }
             }
-            
+
             if curr_block_idx == self.tail_block {
                 break;
             }

@@ -14,7 +14,7 @@ pub struct LiquidityView {
 
 impl Default for LiquidityView {
     fn default() -> Self {
-        Self { 
+        Self {
             open: true,
             last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(1),
             cached_buy_points: Vec::new(),
@@ -53,8 +53,10 @@ impl AppWindow for LiquidityView {
                     self.last_refresh = now;
                 }
 
-                let buy_line = Line::new("Buy", PlotPoints::new(self.cached_buy_points.clone())).color(Color32::BLUE);
-                let sell_line = Line::new("Sell", PlotPoints::new(self.cached_sell_points.clone())).color(Color32::RED);
+                let buy_line = Line::new("Buy", PlotPoints::new(self.cached_buy_points.clone()))
+                    .color(Color32::BLUE);
+                let sell_line = Line::new("Sell", PlotPoints::new(self.cached_sell_points.clone()))
+                    .color(Color32::RED);
 
                 ui.allocate_ui(egui::Vec2::new(480.0, 320.0), |ui| {
                     Plot::new("liquidity_cost_plot")

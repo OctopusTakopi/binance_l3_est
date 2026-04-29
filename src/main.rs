@@ -21,8 +21,7 @@ fn main() -> eframe::Result {
     };
 
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0]),
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
         renderer: eframe::Renderer::Wgpu,
         hardware_acceleration: eframe::HardwareAcceleration::Required,
         ..Default::default()

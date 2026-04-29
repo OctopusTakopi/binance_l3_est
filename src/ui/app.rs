@@ -7,7 +7,6 @@ use std::thread;
 
 use crate::engine::{feature_engine::FeatureEngine, order_book::OrderBook};
 use crate::network::{AppMessage, Control, MarketType, client};
-use crate::types::Trade;
 use crate::ui::window::{AppState, AppWindow};
 use crate::ui::windows::{
     heatmap_view::HeatmapView, liquidity_view::LiquidityView, metrics_view::MetricsView,
@@ -257,10 +256,10 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label("Spot market uses Binance SBE and needs an API key.");
-                if let Some(message) = &self.spot_key_message {
-                    if !message.is_empty() {
-                        ui.label(message);
-                    }
+                if let Some(message) = &self.spot_key_message
+                    && !message.is_empty()
+                {
+                    ui.label(message);
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.edited_spot_api_key)
@@ -326,7 +325,7 @@ impl eframe::App for App {
         // ── 1. Periodic metrics sampling ──────────────────────────────────────
         self.metrics_timer += 1;
         // Sample every 50 frames (approx every 650ms at 75 FPS)
-        if self.metrics_timer % 50 == 0 && self.feature_engine.warmup_samples >= 30 {
+        if self.metrics_timer.is_multiple_of(50) && self.feature_engine.warmup_samples >= 30 {
             let now = ctx.input(|i| i.time);
             self.feature_engine.metrics.sample(now);
             self.feature_engine.metrics.prune(now - 200.0);
@@ -367,17 +366,24 @@ impl eframe::App for App {
                     self.reset_book_only();
                     self.order_book.apply_snapshot(snapshot);
                     while let Some(update) = self.update_buffer.pop_front() {
-                        let _ = self.feature_engine.on_depth_update(update, &mut self.order_book);
+                        let _ = self
+                            .feature_engine
+                            .on_depth_update(update, &mut self.order_book);
                     }
                 }
                 AppMessage::Update { market, update } => {
-                    if market != self.market || !self.symbol_matches_current(update.symbol.as_str()) || !self.symbol_spec_ready {
+                    if market != self.market
+                        || !self.symbol_matches_current(update.symbol.as_str())
+                        || !self.symbol_spec_ready
+                    {
                         continue;
                     }
                     if self.order_book.last_applied_u == 0 {
                         self.update_buffer.push_back(update);
                     } else {
-                        let res = self.feature_engine.on_depth_update(update, &mut self.order_book);
+                        let res = self
+                            .feature_engine
+                            .on_depth_update(update, &mut self.order_book);
                         if let Err(crate::engine::order_book::OrderBookError::SequenceGap) = res {
                             self.order_book.is_synced = false;
                             self.update_buffer.clear();
@@ -386,13 +392,19 @@ impl eframe::App for App {
                     }
                 }
                 AppMessage::Trade { market, trade } => {
-                    if market != self.market || !self.symbol_matches_current(trade.symbol.as_str()) || !self.symbol_spec_ready {
+                    if market != self.market
+                        || !self.symbol_matches_current(trade.symbol.as_str())
+                        || !self.symbol_spec_ready
+                    {
                         continue;
                     }
                     self.feature_engine.on_trade(&trade, &mut self.order_book);
                 }
                 AppMessage::Ticker { market, ticker } => {
-                    if market != self.market || !self.symbol_matches_current(ticker.symbol.as_str()) || !self.symbol_spec_ready {
+                    if market != self.market
+                        || !self.symbol_matches_current(ticker.symbol.as_str())
+                        || !self.symbol_spec_ready
+                    {
                         continue;
                     }
                     self.order_book.apply_ticker_anchor(ticker);

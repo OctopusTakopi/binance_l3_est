@@ -1,7 +1,7 @@
 //! Core order book: storage, state machine sync, and L3-estimation logic.
 
-use crate::types::{BookTicker, DepthUpdate, OrderBookSnapshot, Trade};
 use crate::engine::fast_order_book::FastOrderBook;
+use crate::types::{BookTicker, DepthUpdate, OrderBookSnapshot, Trade};
 use egui_plot::PlotPoint;
 use std::collections::{HashMap, VecDeque};
 
@@ -11,10 +11,8 @@ const TRADE_BUFFER_WINDOW_MS: u64 = 10_000;
 #[derive(Clone, Copy)]
 struct BufferedTrade {
     seq: u64,
-    price_ticks: i64,
     quantity: f64,
     transaction_time: u64,
-    is_buyer_maker: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -60,7 +58,6 @@ pub struct OrderBook {
     best_ask_from_ticker: bool,
     last_top_update_id: Option<u64>,
 }
-
 
 impl Default for OrderBook {
     fn default() -> Self {
@@ -160,7 +157,10 @@ impl OrderBook {
     }
 
     pub fn reset(&mut self) {
-        self.book.slide_window(self.book.base_price_ticks + (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2), true);
+        self.book.slide_window(
+            self.book.base_price_ticks + (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2),
+            true,
+        );
         self.last_applied_u = 0;
         self.is_synced = false;
         self.trade_buffer.clear();
@@ -321,7 +321,7 @@ impl OrderBook {
     fn clear_bids_above(&mut self, price_ticks: i64) {
         let rel = price_ticks + 1 - self.book.base_price_ticks;
         let start_idx = if rel < 0 {
-            0 
+            0
         } else if rel >= crate::engine::fast_order_book::WINDOW_SIZE as i64 {
             return; // No bids are above
         } else {
@@ -352,7 +352,9 @@ impl OrderBook {
         // Use find_first and find_next until we reach end_idx
         let mut curr = self.book.asks_bitset.find_first();
         while let Some(i) = curr {
-            if i >= end_idx { break; }
+            if i >= end_idx {
+                break;
+            }
             self.book.total_qtys[i] = 0;
             self.book.asks_bitset.clear(i);
             self.book.bids_bitset.clear(i);
@@ -383,7 +385,8 @@ impl OrderBook {
                         self.book.queues[idx].pop_front(&mut self.book.pool);
                         to_remove -= first;
                     } else {
-                        self.book.queues[idx].mut_first_size(&mut self.book.pool, |s| *s -= to_remove);
+                        self.book.queues[idx]
+                            .mut_first_size(&mut self.book.pool, |s| *s -= to_remove);
                         to_remove = 0;
                     }
                 }
@@ -412,19 +415,26 @@ impl OrderBook {
     /// exists in the top-N OR if it would land in top-N when inserted (i.e. fewer
     /// than N existing levels strictly outrank it).
     pub fn is_in_top_n(&self, price_ticks: i64, n: usize, is_bid: bool) -> bool {
-        if n == 0 { return false; }
+        if n == 0 {
+            return false;
+        }
         if is_bid {
             // Bids rank by descending price; walk down from best_bid.
             let mut curr = self.book.best_bid();
             for _ in 0..n {
                 match curr {
-                    None => return true,                      // fewer than n bids exist
+                    None => return true, // fewer than n bids exist
                     Some(ticks) if ticks == price_ticks => return true,
                     Some(ticks) if ticks < price_ticks => return true, // walked past it
                     Some(ticks) => {
                         let idx = self.book.get_idx(ticks).unwrap();
-                        if idx == 0 { return true; }
-                        curr = self.book.bids_bitset.find_prev(idx - 1)
+                        if idx == 0 {
+                            return true;
+                        }
+                        curr = self
+                            .book
+                            .bids_bitset
+                            .find_prev(idx - 1)
                             .map(|i| self.book.base_price_ticks + i as i64);
                     }
                 }
@@ -440,7 +450,10 @@ impl OrderBook {
                     Some(ticks) if ticks > price_ticks => return true,
                     Some(ticks) => {
                         let idx = self.book.get_idx(ticks).unwrap();
-                        curr = self.book.asks_bitset.find_next(idx + 1)
+                        curr = self
+                            .book
+                            .asks_bitset
+                            .find_next(idx + 1)
                             .map(|i| self.book.base_price_ticks + i as i64);
                     }
                 }
@@ -458,11 +471,11 @@ impl OrderBook {
         rolling_trade_mean: f64,
     ) -> LevelChangeResult {
         let is_tob = if is_bid {
-            self.best_bid_ticks.map_or(true, |best| price_ticks >= best)
+            self.best_bid_ticks.is_none_or(|best| price_ticks >= best)
         } else {
-            self.best_ask_ticks.map_or(true, |best| price_ticks <= best)
+            self.best_ask_ticks.is_none_or(|best| price_ticks <= best)
         };
-        
+
         let in_top20 = self.is_in_top_n(price_ticks, 20, is_bid);
 
         let idx = match self.book.get_idx(price_ticks) {
@@ -475,13 +488,15 @@ impl OrderBook {
                     self.book.slide_window(price_ticks, true);
                     match self.book.get_idx(price_ticks) {
                         Some(i) => i,
-                        None => return LevelChangeResult {
-                            inflow: 0.0,
-                            cancel: 0.0,
-                            is_tob,
-                            in_top20,
-                            is_bid,
-                        },
+                        None => {
+                            return LevelChangeResult {
+                                inflow: 0.0,
+                                cancel: 0.0,
+                                is_tob,
+                                in_top20,
+                                is_bid,
+                            };
+                        }
                     }
                 } else {
                     return LevelChangeResult {
@@ -508,7 +523,8 @@ impl OrderBook {
                     let avg_trade = rolling_trade_mean.max(0.001);
                     let avg_trade_u64 = self.book.f64_to_u64(avg_trade);
                     if diff > avg_trade_u64 * 2 && diff < avg_trade_u64 * 20 {
-                        let num_fragments = (diff as f64 / avg_trade_u64 as f64).clamp(2.0, 5.0) as usize;
+                        let num_fragments =
+                            (diff as f64 / avg_trade_u64 as f64).clamp(2.0, 5.0) as usize;
                         let fragment_val = diff / num_fragments as u64;
                         let mut remaining = diff;
                         for i in 0..num_fragments {
@@ -551,13 +567,18 @@ impl OrderBook {
                             let consumed = trade_qty_u64.min(remaining_to_remove);
 
                             let mut inner_remaining = consumed;
-                            while inner_remaining > 0 && !self.book.queues[idx].is_empty(&mut self.book.pool) {
+                            while inner_remaining > 0
+                                && !self.book.queues[idx].is_empty(&mut self.book.pool)
+                            {
                                 let first = self.book.queues[idx].first_size(&mut self.book.pool);
                                 if first <= inner_remaining {
                                     inner_remaining -= first;
                                     self.book.queues[idx].pop_front(&mut self.book.pool);
                                 } else {
-                                    self.book.queues[idx].mut_first_size(&mut self.book.pool, |s| *s -= inner_remaining);
+                                    self.book.queues[idx]
+                                        .mut_first_size(&mut self.book.pool, |s| {
+                                            *s -= inner_remaining
+                                        });
                                     inner_remaining = 0;
                                 }
                             }
@@ -588,7 +609,11 @@ impl OrderBook {
 
                 if remaining_to_remove == 0 {
                     if new_total_u64 == 0 {
-                        if is_bid { self.book.bids_bitset.clear(idx); } else { self.book.asks_bitset.clear(idx); }
+                        if is_bid {
+                            self.book.bids_bitset.clear(idx);
+                        } else {
+                            self.book.asks_bitset.clear(idx);
+                        }
                         self.book.clear_queue(idx);
                     } else {
                         self.book.total_qtys[idx] = new_total_u64;
@@ -615,18 +640,27 @@ impl OrderBook {
                     // But the original logic used pop_back if no exact match found.
                     let mut exact_found = false;
                     unsafe {
-                        if self.book.queues[idx].remove_order_by_size_simd(&mut self.book.pool, remaining_to_remove) {
+                        if self.book.queues[idx]
+                            .remove_order_by_size_simd(&mut self.book.pool, remaining_to_remove)
+                        {
                             exact_found = true;
                         }
                     }
 
                     if !exact_found {
-                        while remaining_to_remove > 0 && !self.book.queues[idx].is_empty(&mut self.book.pool) {
-                            if let Some(back_qty) = self.book.queues[idx].pop_back(&mut self.book.pool) {
+                        while remaining_to_remove > 0
+                            && !self.book.queues[idx].is_empty(&mut self.book.pool)
+                        {
+                            if let Some(back_qty) =
+                                self.book.queues[idx].pop_back(&mut self.book.pool)
+                            {
                                 if back_qty <= remaining_to_remove {
                                     remaining_to_remove -= back_qty;
                                 } else {
-                                    self.book.queues[idx].push_back(&mut self.book.pool, back_qty - remaining_to_remove);
+                                    self.book.queues[idx].push_back(
+                                        &mut self.book.pool,
+                                        back_qty - remaining_to_remove,
+                                    );
                                     remaining_to_remove = 0;
                                 }
                             } else {
@@ -636,7 +670,11 @@ impl OrderBook {
                     }
 
                     if new_total_u64 == 0 {
-                        if is_bid { self.book.bids_bitset.clear(idx); } else { self.book.asks_bitset.clear(idx); }
+                        if is_bid {
+                            self.book.bids_bitset.clear(idx);
+                        } else {
+                            self.book.asks_bitset.clear(idx);
+                        }
                         self.book.clear_queue(idx);
                         self.book.total_qtys[idx] = 0;
                     } else {
@@ -685,10 +723,8 @@ impl OrderBook {
             .or_default()
             .push_back(BufferedTrade {
                 seq,
-                price_ticks,
                 quantity: trade.quantity,
                 transaction_time: trade.transaction_time,
-                is_buyer_maker: trade.is_buyer_maker,
             });
         self.trade_expiry_queue.push_back(TradeExpiryRef {
             seq,
@@ -728,11 +764,14 @@ impl OrderBook {
             if cum_qty > QTY_EPSILON {
                 let vwap = weighted_price / cum_qty;
                 let delta_p = ((vwap - mid) / mid * 10_000.0).abs();
-                self.cached_buy_points.push(PlotPoint::new(cum_qty * mid, delta_p));
+                self.cached_buy_points
+                    .push(PlotPoint::new(cum_qty * mid, delta_p));
             }
             count += 1;
-            if count >= 100 { break; } 
-            
+            if count >= 100 {
+                break;
+            }
+
             curr_idx = self.book.asks_bitset.find_next(idx + 1);
         }
 
@@ -751,12 +790,17 @@ impl OrderBook {
             if cum_qty > QTY_EPSILON {
                 let vwap = weighted_price / cum_qty;
                 let delta_p = ((mid - vwap) / mid * 10_000.0).abs();
-                self.cached_sell_points.push(PlotPoint::new(cum_qty * mid, delta_p));
+                self.cached_sell_points
+                    .push(PlotPoint::new(cum_qty * mid, delta_p));
             }
             count += 1;
-            if count >= 100 { break; }
-            
-            if idx == 0 { break; }
+            if count >= 100 {
+                break;
+            }
+
+            if idx == 0 {
+                break;
+            }
             curr_idx = self.book.bids_bitset.find_prev(idx - 1);
         }
 
@@ -765,10 +809,11 @@ impl OrderBook {
     }
 
     pub fn calculate_liquidity_impact(&mut self, execute_usd: f64) -> Option<(f64, f64)> {
-        if self.last_liquidity_id == self.last_applied_u && (execute_usd - self.last_impact_usd).abs() < 1.0 {
-            if let (Some(b), Some(s)) = (self.cached_buy_impact, self.cached_sell_impact) {
-                return Some((b, s));
-            }
+        if self.last_liquidity_id == self.last_applied_u
+            && (execute_usd - self.last_impact_usd).abs() < 1.0
+            && let (Some(b), Some(s)) = (self.cached_buy_impact, self.cached_sell_impact)
+        {
+            return Some((b, s));
         }
 
         let mid = self.mid_price()?;
@@ -777,14 +822,16 @@ impl OrderBook {
         }
 
         let quantity = execute_usd / mid;
-        
+
         // Buy impact (sweep asks)
         let mut remaining = quantity;
         let mut notional = 0.0;
         let mut filled = 0.0;
         let mut curr_idx = self.book.asks_bitset.find_first();
         while let Some(idx) = curr_idx {
-            if remaining <= QTY_EPSILON { break; }
+            if remaining <= QTY_EPSILON {
+                break;
+            }
             let price = self.ticks_to_price(self.book.base_price_ticks + idx as i64);
             let qty = self.book.u64_to_f64(self.book.total_qtys[idx]);
             let take = qty.min(remaining);
@@ -806,14 +853,18 @@ impl OrderBook {
         let mut filled = 0.0;
         let mut curr_idx = self.book.bids_bitset.find_last();
         while let Some(idx) = curr_idx {
-            if remaining <= QTY_EPSILON { break; }
+            if remaining <= QTY_EPSILON {
+                break;
+            }
             let price = self.ticks_to_price(self.book.base_price_ticks + idx as i64);
             let qty = self.book.u64_to_f64(self.book.total_qtys[idx]);
             let take = qty.min(remaining);
             notional += take * price;
             filled += take;
             remaining -= take;
-            if idx == 0 { break; }
+            if idx == 0 {
+                break;
+            }
             curr_idx = self.book.bids_bitset.find_prev(idx - 1);
         }
         let sell_impact = if filled > 0.0 && remaining <= QTY_EPSILON {
@@ -873,7 +924,9 @@ impl OrderBook {
         })
     }
 
-    pub fn iter_asks_with_orders(&self) -> impl Iterator<Item = (i64, impl Iterator<Item = f64> + '_)> + '_ {
+    pub fn iter_asks_with_orders(
+        &self,
+    ) -> impl Iterator<Item = (i64, impl Iterator<Item = f64> + '_)> + '_ {
         let mut curr_idx = self.book.asks_bitset.find_first();
         std::iter::from_fn(move || {
             let idx = curr_idx?;
@@ -881,13 +934,15 @@ impl OrderBook {
             let q_ptr = self.book.queues[idx];
             let pool = &self.book.pool;
             let order_iter = q_ptr.iter(pool).map(|q| self.book.u64_to_f64(q));
-            
+
             curr_idx = self.book.asks_bitset.find_next(idx + 1);
             Some((price_ticks, order_iter))
         })
     }
 
-    pub fn iter_bids_with_orders(&self) -> impl Iterator<Item = (i64, impl Iterator<Item = f64> + '_)> + '_ {
+    pub fn iter_bids_with_orders(
+        &self,
+    ) -> impl Iterator<Item = (i64, impl Iterator<Item = f64> + '_)> + '_ {
         let mut curr_idx = self.book.bids_bitset.find_last();
         std::iter::from_fn(move || {
             let idx = curr_idx?;
@@ -895,7 +950,7 @@ impl OrderBook {
             let q_ptr = self.book.queues[idx];
             let pool = &self.book.pool;
             let order_iter = q_ptr.iter(pool).map(|q| self.book.u64_to_f64(q));
-            
+
             if idx == 0 {
                 curr_idx = None;
             } else {
@@ -967,7 +1022,11 @@ impl OrderBook {
         let idx = self.book.get_idx(price_ticks);
         let qty = idx.and_then(|i| {
             let q = self.book.total_qtys[i];
-            if q > 0 { Some(self.book.u64_to_f64(q)) } else { None }
+            if q > 0 {
+                Some(self.book.u64_to_f64(q))
+            } else {
+                None
+            }
         });
 
         let cached_best_ticks = if is_bid {
@@ -1030,7 +1089,10 @@ impl OrderBook {
     }
 
     fn reset_after_gap(&mut self) {
-        self.book.slide_window(self.book.base_price_ticks + (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2), true);
+        self.book.slide_window(
+            self.book.base_price_ticks + (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2),
+            true,
+        );
         self.trade_buffer.clear();
         self.trade_expiry_queue.clear();
         self.last_changes.clear();
@@ -1078,6 +1140,7 @@ pub struct LevelChangeResult {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::utils::SymbolStr;
@@ -1100,13 +1163,16 @@ mod tests {
         }
     }
 
-    fn buffered_trade(seq: u64, price: f64, quantity: f64, transaction_time: u64) -> BufferedTrade {
+    fn buffered_trade(
+        seq: u64,
+        _price: f64,
+        quantity: f64,
+        transaction_time: u64,
+    ) -> BufferedTrade {
         BufferedTrade {
             seq,
-            price_ticks: (price / 1.0).round() as i64, // Assume 1.0 tick size for tests
             quantity,
             transaction_time,
-            is_buyer_maker: true,
         }
     }
 

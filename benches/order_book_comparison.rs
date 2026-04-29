@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rand::{Rng, SeedableRng};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use binance_l3_est::engine::order_book::OrderBook;
@@ -16,10 +16,15 @@ type BookSide = BTreeMap<i64, (f64, OrderQueue)>;
 const QTY_EPSILON: f64 = 1e-12;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum OldOrderBookError { SequenceGap }
+pub enum OldOrderBookError {
+    SequenceGap,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OldDepthUpdateStatus { Applied, IgnoredStale }
+pub enum OldDepthUpdateStatus {
+    Applied,
+    IgnoredStale,
+}
 
 pub struct OldOrderBook {
     pub bids: BookSide,
@@ -64,15 +69,25 @@ impl OldOrderBook {
         self.bids.clear();
         self.asks.clear();
         for bid in &snap.bids {
-            self.bids.insert(self.price_to_ticks(bid[0]), (bid[1], VecDeque::from([bid[1]])));
+            self.bids.insert(
+                self.price_to_ticks(bid[0]),
+                (bid[1], VecDeque::from([bid[1]])),
+            );
         }
         for ask in &snap.asks {
-            self.asks.insert(self.price_to_ticks(ask[0]), (ask[1], VecDeque::from([ask[1]])));
+            self.asks.insert(
+                self.price_to_ticks(ask[0]),
+                (ask[1], VecDeque::from([ask[1]])),
+            );
         }
         self.last_applied_u = snap.last_update_id;
     }
 
-    pub fn process_update(&mut self, update: DepthUpdate, _mean: f64) -> Result<OldDepthUpdateStatus, OldOrderBookError> {
+    pub fn process_update(
+        &mut self,
+        update: DepthUpdate,
+        _mean: f64,
+    ) -> Result<OldDepthUpdateStatus, OldOrderBookError> {
         for bid in &update.b {
             self.process_level_change(self.price_to_ticks(bid[0]), bid[1], true);
         }
@@ -83,7 +98,11 @@ impl OldOrderBook {
     }
 
     fn process_level_change(&mut self, price_ticks: i64, new_total_qty: f64, is_bid: bool) {
-        let side = if is_bid { &mut self.bids } else { &mut self.asks };
+        let side = if is_bid {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
         if let Some((total_qty, queue)) = side.get_mut(&price_ticks) {
             if new_total_qty > *total_qty + QTY_EPSILON {
                 queue.push_back(new_total_qty - *total_qty);
@@ -92,21 +111,35 @@ impl OldOrderBook {
                 let mut to_rem = *total_qty - new_total_qty;
                 while to_rem > QTY_EPSILON && !queue.is_empty() {
                     let last = queue.len() - 1;
-                    if queue[last] <= to_rem + QTY_EPSILON { to_rem -= queue[last]; queue.pop_back(); }
-                    else { queue[last] -= to_rem; to_rem = 0.0; }
+                    if queue[last] <= to_rem + QTY_EPSILON {
+                        to_rem -= queue[last];
+                        queue.pop_back();
+                    } else {
+                        queue[last] -= to_rem;
+                        to_rem = 0.0;
+                    }
                 }
-                if new_total_qty <= QTY_EPSILON { side.remove(&price_ticks); }
-                else { *total_qty = new_total_qty; }
+                if new_total_qty <= QTY_EPSILON {
+                    side.remove(&price_ticks);
+                } else {
+                    *total_qty = new_total_qty;
+                }
             }
         } else if new_total_qty > QTY_EPSILON {
-            side.insert(price_ticks, (new_total_qty, VecDeque::from([new_total_qty])));
+            side.insert(
+                price_ticks,
+                (new_total_qty, VecDeque::from([new_total_qty])),
+            );
         }
     }
 }
 
 // --- BENCHMARK ---
 
-fn generate_synthetic_data(num_updates: usize, tick_size: f64) -> (OrderBookSnapshot, Vec<DepthUpdate>) {
+fn generate_synthetic_data(
+    num_updates: usize,
+    tick_size: f64,
+) -> (OrderBookSnapshot, Vec<DepthUpdate>) {
     let mut rng = StdRng::seed_from_u64(42);
     let mut bids = Vec::new();
     let mut asks = Vec::new();
@@ -115,19 +148,35 @@ fn generate_synthetic_data(num_updates: usize, tick_size: f64) -> (OrderBookSnap
         bids.push([mid - (i as f64) * tick_size, rng.random_range(0.1..5.0)]);
         asks.push([mid + (i as f64) * tick_size, rng.random_range(0.1..5.0)]);
     }
-    let snapshot = OrderBookSnapshot { last_update_id: 1000, bids, asks };
+    let snapshot = OrderBookSnapshot {
+        last_update_id: 1000,
+        bids,
+        asks,
+    };
     let mut updates = Vec::new();
     for i in 0..num_updates {
         let mut b = Vec::new();
         let mut a = Vec::new();
         for _ in 0..2 {
-            b.push([mid - (rng.random_range(1..=500) as f64) * tick_size, rng.random_range(0.0..6.0)]);
-            a.push([mid + (rng.random_range(1..=500) as f64) * tick_size, rng.random_range(0.0..6.0)]);
+            b.push([
+                mid - (rng.random_range(1..=500) as f64) * tick_size,
+                rng.random_range(0.0..6.0),
+            ]);
+            a.push([
+                mid + (rng.random_range(1..=500) as f64) * tick_size,
+                rng.random_range(0.0..6.0),
+            ]);
         }
         updates.push(DepthUpdate {
-            event_type: "depthUpdate".to_string(), event_time: 0, transaction_time: 0,
-            symbol: SymbolStr::from("BTCUSDT"), capital_u: 0, small_u: 1001 + i as u64,
-            pu: None, b, a,
+            event_type: "depthUpdate".to_string(),
+            event_time: 0,
+            transaction_time: 0,
+            symbol: SymbolStr::from("BTCUSDT"),
+            capital_u: 0,
+            small_u: 1001 + i as u64,
+            pu: None,
+            b,
+            a,
         });
     }
     (snapshot, updates)

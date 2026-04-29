@@ -83,7 +83,9 @@ impl OrderBookView {
                         ui.end_row();
 
                         // Take top 20 asks from cached list
-                        for (price_ticks, level_total) in self.cached_ask_levels.iter().take(20).rev() {
+                        for (price_ticks, level_total) in
+                            self.cached_ask_levels.iter().take(20).rev()
+                        {
                             ui.label("");
                             let price = ob.ticks_to_price(*price_ticks);
                             ui.label(format!("{:.1$}", price, state.price_prec));
@@ -113,7 +115,8 @@ impl OrderBookView {
                     self.cached_bid_levels = ob.iter_bids().take(200).collect();
                     self.cached_ask_levels = ob.iter_asks().take(200).collect();
 
-                    self.cached_max_qty = self.cached_bid_levels
+                    self.cached_max_qty = self
+                        .cached_bid_levels
                         .iter()
                         .chain(self.cached_ask_levels.iter())
                         .map(|(_, q)| *q)
@@ -121,11 +124,15 @@ impl OrderBookView {
 
                     let mut max_bid_order = 0.0_f64;
                     for (_, order_iter) in ob.iter_bids_with_orders().take(200) {
-                        for q in order_iter { max_bid_order = max_bid_order.max(q); }
+                        for q in order_iter {
+                            max_bid_order = max_bid_order.max(q);
+                        }
                     }
                     let mut max_ask_order = 0.0_f64;
                     for (_, order_iter) in ob.iter_asks_with_orders().take(200) {
-                        for q in order_iter { max_ask_order = max_ask_order.max(q); }
+                        for q in order_iter {
+                            max_ask_order = max_ask_order.max(q);
+                        }
                     }
 
                     self.cached_bars = if !self.kmeans_mode {
@@ -220,13 +227,20 @@ fn build_normal_bars(
         let x = (i as f64 + 0.5) * step + 0.5;
         let mut offset = 0.0;
         for (j, qty) in order_iter.enumerate() {
-            if qty <= 0.0 { continue; }
+            if qty <= 0.0 {
+                continue;
+            }
             let color = if qty == max_ask && qty > 0.0 {
                 Color32::GOLD
             } else {
                 OrderBookView::order_color(j, Color32::DARK_RED, brighter_step as f32 / 100.0)
             };
-            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
+            bars.push(
+                Bar::new(x, qty)
+                    .fill(color)
+                    .base_offset(offset)
+                    .width(step * 0.9),
+            );
             offset += qty;
         }
     }
@@ -234,13 +248,20 @@ fn build_normal_bars(
         let x = -(i as f64 + 0.5) * step - 0.5;
         let mut offset = 0.0;
         for (j, qty) in order_iter.enumerate() {
-            if qty <= 0.0 { continue; }
+            if qty <= 0.0 {
+                continue;
+            }
             let color = if qty == max_bid && qty > 0.0 {
                 Color32::GOLD
             } else {
                 OrderBookView::order_color(j, Color32::DARK_GREEN, brighter_step as f32 / 100.0)
             };
-            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
+            bars.push(
+                Bar::new(x, qty)
+                    .fill(color)
+                    .base_offset(offset)
+                    .width(step * 0.9),
+            );
             offset += qty;
         }
     }
@@ -269,9 +290,17 @@ fn build_kmeans_bars(
             let color = if qty == max_ask && qty > 0.0 {
                 Color32::GOLD
             } else {
-                ASK_COLORS.get(cluster % ASK_COLORS.len()).cloned().unwrap_or(Color32::GRAY)
+                ASK_COLORS
+                    .get(cluster % ASK_COLORS.len())
+                    .cloned()
+                    .unwrap_or(Color32::GRAY)
             };
-            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
+            bars.push(
+                Bar::new(x, qty)
+                    .fill(color)
+                    .base_offset(offset)
+                    .width(step * 0.9),
+            );
             offset += qty;
         }
     }
@@ -282,9 +311,17 @@ fn build_kmeans_bars(
             let color = if qty == max_bid && qty > 0.0 {
                 Color32::GOLD
             } else {
-                BID_COLORS.get(cluster % BID_COLORS.len()).cloned().unwrap_or(Color32::GRAY)
+                BID_COLORS
+                    .get(cluster % BID_COLORS.len())
+                    .cloned()
+                    .unwrap_or(Color32::GRAY)
             };
-            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
+            bars.push(
+                Bar::new(x, qty)
+                    .fill(color)
+                    .base_offset(offset)
+                    .width(step * 0.9),
+            );
             offset += qty;
         }
     }

@@ -1,13 +1,13 @@
 //! Heatmap window: depth-time visualisation.
 
 use crate::ui::window::{AppState, AppWindow};
-use eframe::egui::{self, Color32, TextureOptions, TextureHandle};
+use eframe::egui::{self, Color32, TextureHandle, TextureOptions};
 
 pub struct HeatmapView {
     open: bool,
     pub contrast: f64,
     auto_scaled: bool,
-    
+
     // Caching for performance
     cached_texture: Option<TextureHandle>,
     last_update_id: u64,
@@ -79,7 +79,9 @@ impl AppWindow for HeatmapView {
                     return;
                 }
 
-                if self.last_update_id != hm.last_update_id || (self.contrast - self.last_contrast).abs() > 0.01 {
+                if self.last_update_id != hm.last_update_id
+                    || (self.contrast - self.last_contrast).abs() > 0.01
+                {
                     let width = hm.data.len();
                     let height = hm.height;
                     let contrast = self.contrast;
@@ -112,7 +114,11 @@ impl AppWindow for HeatmapView {
                         source_size: Default::default(),
                         pixels,
                     };
-                    self.cached_texture = Some(ui.ctx().load_texture("heatmap", color_image, TextureOptions::LINEAR));
+                    self.cached_texture = Some(ui.ctx().load_texture(
+                        "heatmap",
+                        color_image,
+                        TextureOptions::LINEAR,
+                    ));
                     self.last_update_id = hm.last_update_id;
                     self.last_contrast = self.contrast;
                 }

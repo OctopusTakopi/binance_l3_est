@@ -5,6 +5,7 @@ use crate::ui::window::{AppState, AppWindow};
 use eframe::egui::{self, Align2, Color32, Vec2};
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoint, PlotPoints, Text};
 
+#[derive(Default)]
 pub struct TwapView {
     open: bool,
     cached_bars_buy: Vec<Bar>,
@@ -13,20 +14,6 @@ pub struct TwapView {
     last_psd_len_sell: usize,
     last_peaks_len_buy: usize,
     last_peaks_len_sell: usize,
-}
-
-impl Default for TwapView {
-    fn default() -> Self {
-        Self {
-            open: false,
-            cached_bars_buy: Vec::new(),
-            cached_bars_sell: Vec::new(),
-            last_psd_len_buy: 0,
-            last_psd_len_sell: 0,
-            last_peaks_len_buy: 0,
-            last_peaks_len_sell: 0,
-        }
-    }
 }
 
 impl AppWindow for TwapView {
@@ -90,8 +77,14 @@ impl AppWindow for TwapView {
                 }
 
                 if !twap.psd_buy.is_empty() {
-                    if twap.psd_buy.len() != self.last_psd_len_buy || twap.peaks_buy.len() != self.last_peaks_len_buy {
-                        self.cached_bars_buy = build_psd_bars(&twap.psd_buy, &twap.peaks_buy, Color32::from_rgb(60, 140, 255));
+                    if twap.psd_buy.len() != self.last_psd_len_buy
+                        || twap.peaks_buy.len() != self.last_peaks_len_buy
+                    {
+                        self.cached_bars_buy = build_psd_bars(
+                            &twap.psd_buy,
+                            &twap.peaks_buy,
+                            Color32::from_rgb(60, 140, 255),
+                        );
                         self.last_psd_len_buy = twap.psd_buy.len();
                         self.last_peaks_len_buy = twap.peaks_buy.len();
                     }
@@ -111,8 +104,14 @@ impl AppWindow for TwapView {
                 ui.separator();
 
                 if !twap.psd_sell.is_empty() {
-                    if twap.psd_sell.len() != self.last_psd_len_sell || twap.peaks_sell.len() != self.last_peaks_len_sell {
-                        self.cached_bars_sell = build_psd_bars(&twap.psd_sell, &twap.peaks_sell, Color32::from_rgb(220, 80, 80));
+                    if twap.psd_sell.len() != self.last_psd_len_sell
+                        || twap.peaks_sell.len() != self.last_peaks_len_sell
+                    {
+                        self.cached_bars_sell = build_psd_bars(
+                            &twap.psd_sell,
+                            &twap.peaks_sell,
+                            Color32::from_rgb(220, 80, 80),
+                        );
                         self.last_psd_len_sell = twap.psd_sell.len();
                         self.last_peaks_len_sell = twap.peaks_sell.len();
                     }
@@ -195,7 +194,7 @@ fn render_psd_cached(
                             PlotPoints::from_iter([[*freq, 0.0], [*freq, max_power * 1.05]]),
                         )
                         .color(Color32::from_rgb(255, 80, 80))
-                        .width(2.0),
+                        .width(2.0_f32),
                     );
                     plot_ui.text(
                         Text::new(lbl.clone(), PlotPoint::new(*freq, max_power * 1.05), lbl)

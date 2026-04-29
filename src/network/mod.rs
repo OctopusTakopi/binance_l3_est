@@ -45,12 +45,16 @@ pub enum AppMessage {
         ticker: BookTicker,
     },
     SpotApiKeyRequired {
+        #[allow(dead_code)]
         symbol: String,
+        #[allow(dead_code)]
         market: MarketType,
         message: String,
     },
     NetworkWarning {
+        #[allow(dead_code)]
         symbol: String,
+        #[allow(dead_code)]
         market: MarketType,
         message: String,
     },

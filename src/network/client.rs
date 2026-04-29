@@ -94,12 +94,12 @@ fn parse_symbol_spec(info: &crate::types::SymbolInfo) -> Result<SymbolSpec> {
                     price_prec = Some(decimal_places(ts));
                 }
             }
-        } else if filter.filter_type == "LOT_SIZE" {
-            if let Some(ss) = &filter.step_size {
-                let parsed = ss.parse::<f64>()?;
-                if parsed > 0.0 {
-                    qty_prec = Some(decimal_places(ss));
-                }
+        } else if filter.filter_type == "LOT_SIZE"
+            && let Some(ss) = &filter.step_size
+        {
+            let parsed = ss.parse::<f64>()?;
+            if parsed > 0.0 {
+                qty_prec = Some(decimal_places(ss));
             }
         }
     }
@@ -493,24 +493,26 @@ async fn connect_futures_json(
                     };
 
                     let mut needs_repaint = false;
-                    
+
                     if combined.stream.ends_with(&depth_suffix) {
-                        if let Ok(update) = serde_json::from_str::<DepthUpdate>(combined.data.get()) {
+                        if let Ok(update) = serde_json::from_str::<DepthUpdate>(combined.data.get())
+                        {
                             let _ = tx_clone.send(AppMessage::Update { market, update });
                             needs_repaint = true;
                         }
                     } else if combined.stream.ends_with("@trade") {
-                        if let Ok(trade) = serde_json::from_str::<Trade>(combined.data.get()) {
-                            if trade.order_type != "NA" && trade.price > 0.0 {
-                                let _ = tx_clone.send(AppMessage::Trade { market, trade });
-                                needs_repaint = true;
-                            }
-                        }
-                    } else if combined.stream.ends_with(&ticker_suffix) {
-                        if let Ok(ticker) = serde_json::from_str::<BookTicker>(combined.data.get()) {
-                            let _ = tx_clone.send(AppMessage::Ticker { market, ticker });
+                        if let Ok(trade) = serde_json::from_str::<Trade>(combined.data.get())
+                            && trade.order_type != "NA"
+                            && trade.price > 0.0
+                        {
+                            let _ = tx_clone.send(AppMessage::Trade { market, trade });
                             needs_repaint = true;
                         }
+                    } else if combined.stream.ends_with(&ticker_suffix)
+                        && let Ok(ticker) = serde_json::from_str::<BookTicker>(combined.data.get())
+                    {
+                        let _ = tx_clone.send(AppMessage::Ticker { market, ticker });
+                        needs_repaint = true;
                     }
 
                     if needs_repaint {

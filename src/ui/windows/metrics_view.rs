@@ -13,7 +13,7 @@ pub struct MetricsView {
 
 impl Default for MetricsView {
     fn default() -> Self {
-        Self { 
+        Self {
             open: true,
             last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(1),
             cache: HashMap::new(),
@@ -63,10 +63,20 @@ impl AppWindow for MetricsView {
                 }
 
                 // CTR Top-1
-                self.render_ratio_plot_from_cache(ui, "top1_plot", "Top-1 Ratio", egui::Id::new("ctr_top1"));
+                self.render_ratio_plot_from_cache(
+                    ui,
+                    "top1_plot",
+                    "Top-1 Ratio",
+                    egui::Id::new("ctr_top1"),
+                );
                 ui.add_space(4.0);
                 // CTR Top-20
-                self.render_ratio_plot_from_cache(ui, "top20_plot", "Top-20 Ratio", egui::Id::new("ctr_top20"));
+                self.render_ratio_plot_from_cache(
+                    ui,
+                    "top20_plot",
+                    "Top-20 Ratio",
+                    egui::Id::new("ctr_top20"),
+                );
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -74,10 +84,20 @@ impl AppWindow for MetricsView {
                 ui.label("OTR > 1.0: Liquidity Adding > Taking (Reloading)");
 
                 // OTR Top-1
-                self.render_ratio_plot_from_cache(ui, "otr_top1_plot", "Top-1 OTR", egui::Id::new("otr_top1"));
+                self.render_ratio_plot_from_cache(
+                    ui,
+                    "otr_top1_plot",
+                    "Top-1 OTR",
+                    egui::Id::new("otr_top1"),
+                );
                 ui.add_space(4.0);
                 // OTR Top-20
-                self.render_ratio_plot_from_cache(ui, "otr_top20_plot", "Top-20 OTR", egui::Id::new("otr_top20"));
+                self.render_ratio_plot_from_cache(
+                    ui,
+                    "otr_top20_plot",
+                    "Top-20 OTR",
+                    egui::Id::new("otr_top20"),
+                );
             });
         self.open = open;
     }
@@ -85,26 +105,44 @@ impl AppWindow for MetricsView {
 
 impl MetricsView {
     fn update_cache(&mut self, m: &crate::engine::metrics::MetricsState) {
-        self.cache.insert("top1_plot".to_string(), vec![
-            m.ctr_history_bid_top1.iter().map(|p| [p.x, p.y]).collect(),
-            m.ctr_history_ask_top1.iter().map(|p| [p.x, p.y]).collect(),
-            m.ctr_history_both_top1.iter().map(|p| [p.x, p.y]).collect(),
-        ]);
-        self.cache.insert("top20_plot".to_string(), vec![
-            m.ctr_history_bid_top20.iter().map(|p| [p.x, p.y]).collect(),
-            m.ctr_history_ask_top20.iter().map(|p| [p.x, p.y]).collect(),
-            m.ctr_history_both_top20.iter().map(|p| [p.x, p.y]).collect(),
-        ]);
-        self.cache.insert("otr_top1_plot".to_string(), vec![
-            m.otr_history_bid_top1.iter().map(|p| [p.x, p.y]).collect(),
-            m.otr_history_ask_top1.iter().map(|p| [p.x, p.y]).collect(),
-            m.otr_history_both_top1.iter().map(|p| [p.x, p.y]).collect(),
-        ]);
-        self.cache.insert("otr_top20_plot".to_string(), vec![
-            m.otr_history_bid_top20.iter().map(|p| [p.x, p.y]).collect(),
-            m.otr_history_ask_top20.iter().map(|p| [p.x, p.y]).collect(),
-            m.otr_history_both_top20.iter().map(|p| [p.x, p.y]).collect(),
-        ]);
+        self.cache.insert(
+            "top1_plot".to_string(),
+            vec![
+                m.ctr_history_bid_top1.iter().map(|p| [p.x, p.y]).collect(),
+                m.ctr_history_ask_top1.iter().map(|p| [p.x, p.y]).collect(),
+                m.ctr_history_both_top1.iter().map(|p| [p.x, p.y]).collect(),
+            ],
+        );
+        self.cache.insert(
+            "top20_plot".to_string(),
+            vec![
+                m.ctr_history_bid_top20.iter().map(|p| [p.x, p.y]).collect(),
+                m.ctr_history_ask_top20.iter().map(|p| [p.x, p.y]).collect(),
+                m.ctr_history_both_top20
+                    .iter()
+                    .map(|p| [p.x, p.y])
+                    .collect(),
+            ],
+        );
+        self.cache.insert(
+            "otr_top1_plot".to_string(),
+            vec![
+                m.otr_history_bid_top1.iter().map(|p| [p.x, p.y]).collect(),
+                m.otr_history_ask_top1.iter().map(|p| [p.x, p.y]).collect(),
+                m.otr_history_both_top1.iter().map(|p| [p.x, p.y]).collect(),
+            ],
+        );
+        self.cache.insert(
+            "otr_top20_plot".to_string(),
+            vec![
+                m.otr_history_bid_top20.iter().map(|p| [p.x, p.y]).collect(),
+                m.otr_history_ask_top20.iter().map(|p| [p.x, p.y]).collect(),
+                m.otr_history_both_top20
+                    .iter()
+                    .map(|p| [p.x, p.y])
+                    .collect(),
+            ],
+        );
     }
 
     fn render_ratio_plot_from_cache(
@@ -114,7 +152,9 @@ impl MetricsView {
         y_label: &str,
         link_group: egui::Id,
     ) {
-        let Some(cached) = self.cache.get(plot_id) else { return; };
+        let Some(cached) = self.cache.get(plot_id) else {
+            return;
+        };
 
         ui.allocate_ui(egui::Vec2::new(480.0, 160.0), |ui| {
             Plot::new(plot_id)
@@ -123,9 +163,15 @@ impl MetricsView {
                 .y_axis_label(y_label)
                 .legend(egui_plot::Legend::default())
                 .show(ui, |plot_ui| {
-                    plot_ui.line(Line::new("Bid", PlotPoints::new(cached[0].clone())).color(Color32::GREEN));
-                    plot_ui.line(Line::new("Ask", PlotPoints::new(cached[1].clone())).color(Color32::RED));
-                    plot_ui.line(Line::new("Both", PlotPoints::new(cached[2].clone())).color(Color32::WHITE));
+                    plot_ui.line(
+                        Line::new("Bid", PlotPoints::new(cached[0].clone())).color(Color32::GREEN),
+                    );
+                    plot_ui.line(
+                        Line::new("Ask", PlotPoints::new(cached[1].clone())).color(Color32::RED),
+                    );
+                    plot_ui.line(
+                        Line::new("Both", PlotPoints::new(cached[2].clone())).color(Color32::WHITE),
+                    );
                 });
         });
     }
