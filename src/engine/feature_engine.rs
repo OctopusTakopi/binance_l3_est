@@ -73,16 +73,16 @@ impl FeatureEngine {
 
         // Metrics: track fills at the book price.
         let trade_ticks = book.price_to_ticks(trade.price);
-        let best_bid = book.bids.keys().next_back().copied().unwrap_or_default();
-        let best_ask = book.asks.keys().next().copied().unwrap_or_default();
+        let best_bid = book.book.best_bid().unwrap_or_default();
+        let best_ask = book.book.best_ask().unwrap_or_default();
 
         if trade.is_buyer_maker {
             let is_tob = trade_ticks == best_bid;
-            let in_top20 = book.bids.keys().rev().take(20).any(|&p| p == trade_ticks);
+            let in_top20 = book.is_in_top_n(trade_ticks, 20, true);
             self.metrics.on_fill(Side::Bid, is_tob, in_top20, qty);
         } else {
             let is_tob = trade_ticks == best_ask;
-            let in_top20 = book.asks.keys().take(20).any(|&p| p == trade_ticks);
+            let in_top20 = book.is_in_top_n(trade_ticks, 20, false);
             self.metrics.on_fill(Side::Ask, is_tob, in_top20, qty);
         }
 
@@ -116,13 +116,13 @@ impl FeatureEngine {
             }
         }
 
-        // Batch heatmap updates (every 10 messages ≈ 100ms on Binance).
+        // Batch heatmap updates (every 50 messages ≈ 500ms on Binance).
         self.update_counter += 1;
-        if self.update_counter >= 10 {
+        if self.update_counter >= 50 {
             self.update_counter = 0;
-            self.heatmap.update_rolling_stats(&book.bids, &book.asks);
+            self.heatmap.update_rolling_stats(book);
             if self.heatmap.warmup_samples >= 30 {
-                self.heatmap.append(&book.bids, &book.asks);
+                self.heatmap.append(book);
             }
             self.warmup_samples = self.warmup_samples.saturating_add(1);
         }

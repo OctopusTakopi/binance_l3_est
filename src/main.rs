@@ -20,9 +20,17 @@ fn main() -> eframe::Result {
         }
     };
 
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0]),
+        renderer: eframe::Renderer::Wgpu,
+        hardware_acceleration: eframe::HardwareAcceleration::Required,
+        ..Default::default()
+    };
+
     eframe::run_native(
         "Order Book Visualizer",
-        eframe::NativeOptions::default(),
+        native_options,
         Box::new(move |cc| Ok(Box::new(ui::app::App::new(cc, symbol, market)))),
     )
 }

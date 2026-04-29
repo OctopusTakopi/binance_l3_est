@@ -5,8 +5,6 @@ use crate::ui::colors::{ASK_COLORS, BID_COLORS};
 use crate::ui::window::{AppState, AppWindow};
 use eframe::egui::{self, Align2, Color32};
 use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text};
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
 
 pub struct OrderBookView {
     open: bool,
@@ -14,10 +12,17 @@ pub struct OrderBookView {
     pub batch_size: usize,
     pub max_iter: usize,
     pub brighter_step: usize,
-    /// Persistent KMeans for ask side — centroids warm-start across frames.
     km_ask: MiniBatchKMeans,
-    /// Persistent KMeans for bid side — centroids warm-start across frames.
     km_bid: MiniBatchKMeans,
+
+    // Caching for performance
+    last_update_id: u64,
+    cached_bars: Vec<Bar>,
+    cached_max_bid_order: f64,
+    cached_max_ask_order: f64,
+    cached_bid_levels: Vec<(i64, f64)>,
+    cached_ask_levels: Vec<(i64, f64)>,
+    cached_max_qty: f64,
 }
 
 impl Default for OrderBookView {
@@ -30,6 +35,13 @@ impl Default for OrderBookView {
             brighter_step: 5,
             km_ask: MiniBatchKMeans::new(10, 1024, 1024),
             km_bid: MiniBatchKMeans::new(10, 1024, 1024),
+            last_update_id: 0,
+            cached_bars: Vec::new(),
+            cached_max_bid_order: 0.0,
+            cached_max_ask_order: 0.0,
+            cached_bid_levels: Vec::new(),
+            cached_ask_levels: Vec::new(),
+            cached_max_qty: 0.0,
         }
     }
 }
@@ -70,11 +82,12 @@ impl OrderBookView {
                         ui.label("Quantity");
                         ui.end_row();
 
-                        for (price_ticks, (level_total, _)) in ob.asks.iter().take(20).rev() {
+                        // Take top 20 asks from cached list
+                        for (price_ticks, level_total) in self.cached_ask_levels.iter().take(20).rev() {
                             ui.label("");
                             let price = ob.ticks_to_price(*price_ticks);
                             ui.label(format!("{:.1$}", price, state.price_prec));
-                            ui.label(format!("{:.1$}", level_total, state.qty_prec));
+                            ui.label(format!("{:.1$}", *level_total, state.qty_prec));
                             ui.end_row();
                         }
 
@@ -83,79 +96,60 @@ impl OrderBookView {
                         ui.label("Quantity");
                         ui.end_row();
 
-                        for (price_ticks, (level_total, _)) in ob.bids.iter().rev().take(20) {
+                        // Take top 20 bids from cached list
+                        for (price_ticks, level_total) in self.cached_bid_levels.iter().take(20) {
                             ui.label("");
                             let price = ob.ticks_to_price(*price_ticks);
                             ui.label(format!("{:.1$}", price, state.price_prec));
-                            ui.label(format!("{:.1$}", level_total, state.qty_prec));
+                            ui.label(format!("{:.1$}", *level_total, state.qty_prec));
                             ui.end_row();
                         }
                     });
             });
 
             ui.vertical(|ui| {
-                let bid_levels: Vec<(i64, f64)> = ob
-                    .bids
-                    .iter()
-                    .rev()
-                    .take(200)
-                    .map(|(k, (lt, _))| (*k, *lt))
-                    .collect();
-                let ask_levels: Vec<(i64, f64)> = ob
-                    .asks
-                    .iter()
-                    .take(200)
-                    .map(|(k, (lt, _))| (*k, *lt))
-                    .collect();
-
-                let max_qty = bid_levels
-                    .iter()
-                    .chain(ask_levels.iter())
-                    .map(|(_, q)| *q)
-                    .fold(0.0_f64, f64::max);
-
-                let max_bid_order = ob
-                    .bids
-                    .values()
-                    .rev()
-                    .take(200)
-                    .flat_map(|(_, dq)| dq.iter())
-                    .cloned()
-                    .fold(0.0_f64, f64::max);
-                let max_ask_order = ob
-                    .asks
-                    .values()
-                    .take(200)
-                    .flat_map(|(_, dq)| dq.iter())
-                    .cloned()
-                    .fold(0.0_f64, f64::max);
-
-                let second_max_bid_order = nth_largest(ob.bids.values().rev().take(200), 1);
-                let second_max_ask_order = nth_largest(ob.asks.values().take(200), 1);
-
                 let step = 1.0_f64;
-                let bars = if !self.kmeans_mode {
-                    build_normal_bars(
-                        &ob.asks,
-                        &ob.bids,
-                        max_ask_order,
-                        second_max_ask_order,
-                        max_bid_order,
-                        second_max_bid_order,
-                        step,
-                        self.brighter_step,
-                    )
-                } else {
-                    build_kmeans_bars(
-                        &ob.asks,
-                        &ob.bids,
-                        max_ask_order,
-                        max_bid_order,
-                        step,
-                        &mut self.km_ask,
-                        &mut self.km_bid,
-                    )
-                };
+                if self.last_update_id != ob.last_applied_u {
+                    self.cached_bid_levels = ob.iter_bids().take(200).collect();
+                    self.cached_ask_levels = ob.iter_asks().take(200).collect();
+
+                    self.cached_max_qty = self.cached_bid_levels
+                        .iter()
+                        .chain(self.cached_ask_levels.iter())
+                        .map(|(_, q)| *q)
+                        .fold(0.0_f64, f64::max);
+
+                    let mut max_bid_order = 0.0_f64;
+                    for (_, order_iter) in ob.iter_bids_with_orders().take(200) {
+                        for q in order_iter { max_bid_order = max_bid_order.max(q); }
+                    }
+                    let mut max_ask_order = 0.0_f64;
+                    for (_, order_iter) in ob.iter_asks_with_orders().take(200) {
+                        for q in order_iter { max_ask_order = max_ask_order.max(q); }
+                    }
+
+                    self.cached_bars = if !self.kmeans_mode {
+                        build_normal_bars(
+                            ob,
+                            max_ask_order,
+                            max_bid_order,
+                            step,
+                            self.brighter_step,
+                        )
+                    } else {
+                        build_kmeans_bars(
+                            ob,
+                            max_ask_order,
+                            max_bid_order,
+                            step,
+                            &mut self.km_ask,
+                            &mut self.km_bid,
+                        )
+                    };
+                    self.cached_max_bid_order = max_bid_order;
+                    self.cached_max_ask_order = max_ask_order;
+                    self.last_update_id = ob.last_applied_u;
+                }
 
                 Plot::new("orderbook_chart")
                     .allow_drag(false)
@@ -163,15 +157,15 @@ impl OrderBookView {
                     .allow_zoom(false)
                     .show_axes([true, true])
                     .show(ui, |plot_ui| {
-                        plot_ui.bar_chart(BarChart::new("ob", bars));
+                        plot_ui.bar_chart(BarChart::new("ob", self.cached_bars.clone()));
 
-                        for (i, (price_ticks, _)) in bid_levels.iter().enumerate() {
+                        for (i, (price_ticks, _)) in self.cached_bid_levels.iter().enumerate() {
                             if i % 20 == 0 {
                                 let x = -(i as f64 + 0.5) * step - 0.5;
                                 plot_ui.text(
                                     Text::new(
                                         "bid",
-                                        PlotPoint::new(x, -max_qty * 0.05),
+                                        PlotPoint::new(x, -self.cached_max_qty * 0.05),
                                         format!(
                                             "{:.1$}",
                                             ob.ticks_to_price(*price_ticks),
@@ -182,13 +176,13 @@ impl OrderBookView {
                                 );
                             }
                         }
-                        for (i, (price_ticks, _)) in ask_levels.iter().enumerate() {
+                        for (i, (price_ticks, _)) in self.cached_ask_levels.iter().enumerate() {
                             if i % 20 == 0 && i != 0 {
                                 let x = (i as f64 + 0.5) * step + 0.5;
                                 plot_ui.text(
                                     Text::new(
                                         "ask",
-                                        PlotPoint::new(x, -max_qty * 0.05),
+                                        PlotPoint::new(x, -self.cached_max_qty * 0.05),
                                         format!(
                                             "{:.1$}",
                                             ob.ticks_to_price(*price_ticks),
@@ -215,59 +209,38 @@ impl OrderBookView {
 }
 
 fn build_normal_bars(
-    asks: &BTreeMap<i64, (f64, VecDeque<f64>)>,
-    bids: &BTreeMap<i64, (f64, VecDeque<f64>)>,
+    ob: &crate::engine::order_book::OrderBook,
     max_ask: f64,
-    second_max_ask: f64,
     max_bid: f64,
-    second_max_bid: f64,
     step: f64,
     brighter_step: usize,
 ) -> Vec<Bar> {
     let mut bars = Vec::new();
-    for (i, (_, (_, qty_deq))) in asks.iter().take(200).enumerate() {
+    for (i, (_price, order_iter)) in ob.iter_asks_with_orders().take(200).enumerate() {
         let x = (i as f64 + 0.5) * step + 0.5;
         let mut offset = 0.0;
-        for (j, &qty) in qty_deq.iter().enumerate() {
-            if qty <= 0.0 {
-                continue;
-            }
-            let color = if qty == max_ask {
+        for (j, qty) in order_iter.enumerate() {
+            if qty <= 0.0 { continue; }
+            let color = if qty == max_ask && qty > 0.0 {
                 Color32::GOLD
-            } else if qty == second_max_ask {
-                Color32::from_rgb(184, 134, 11)
             } else {
                 OrderBookView::order_color(j, Color32::DARK_RED, brighter_step as f32 / 100.0)
             };
-            bars.push(
-                Bar::new(x, qty)
-                    .fill(color)
-                    .base_offset(offset)
-                    .width(step * 0.9),
-            );
+            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
             offset += qty;
         }
     }
-    for (i, (_, (_, qty_deq))) in bids.iter().rev().take(200).enumerate() {
+    for (i, (_price, order_iter)) in ob.iter_bids_with_orders().take(200).enumerate() {
         let x = -(i as f64 + 0.5) * step - 0.5;
         let mut offset = 0.0;
-        for (j, &qty) in qty_deq.iter().enumerate() {
-            if qty <= 0.0 {
-                continue;
-            }
-            let color = if qty == max_bid {
+        for (j, qty) in order_iter.enumerate() {
+            if qty <= 0.0 { continue; }
+            let color = if qty == max_bid && qty > 0.0 {
                 Color32::GOLD
-            } else if qty == second_max_bid {
-                Color32::from_rgb(184, 134, 11)
             } else {
                 OrderBookView::order_color(j, Color32::DARK_GREEN, brighter_step as f32 / 100.0)
             };
-            bars.push(
-                Bar::new(x, qty)
-                    .fill(color)
-                    .base_offset(offset)
-                    .width(step * 0.9),
-            );
+            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
             offset += qty;
         }
     }
@@ -275,74 +248,45 @@ fn build_normal_bars(
 }
 
 fn build_kmeans_bars(
-    asks: &BTreeMap<i64, (f64, VecDeque<f64>)>,
-    bids: &BTreeMap<i64, (f64, VecDeque<f64>)>,
+    ob: &crate::engine::order_book::OrderBook,
     max_ask: f64,
     max_bid: f64,
     step: f64,
     km_ask: &mut MiniBatchKMeans,
     km_bid: &mut MiniBatchKMeans,
 ) -> Vec<Bar> {
-    let labels_a: Vec<usize> = km_ask.fit_iter(asks.iter().take(200)).to_vec();
-    let clustered_a = build_clustered_orders(asks.iter().take(200), &labels_a);
+    let labels_a = km_ask.fit_iter(ob.iter_asks_with_orders().take(200));
+    let clustered_a = build_clustered_orders(ob.iter_asks_with_orders().take(200), labels_a);
 
-    let labels_b: Vec<usize> = km_bid.fit_iter(bids.iter().rev().take(200)).to_vec();
-    let clustered_b = build_clustered_orders(bids.iter().rev().take(200), &labels_b);
+    let labels_b = km_bid.fit_iter(ob.iter_bids_with_orders().take(200));
+    let clustered_b = build_clustered_orders(ob.iter_bids_with_orders().take(200), labels_b);
 
     let mut bars = Vec::new();
-    for (i, (_, qty_deq)) in clustered_a.iter().enumerate() {
+    for (i, (_price, level_orders)) in clustered_a.into_iter().enumerate() {
         let x = (i as f64 + 0.5) * step + 0.5;
         let mut offset = 0.0;
-        for &(qty, cluster) in qty_deq.iter() {
-            if qty <= 0.0 {
-                continue;
-            }
-            let color = if qty == max_ask {
+        for (qty, cluster) in level_orders {
+            let color = if qty == max_ask && qty > 0.0 {
                 Color32::GOLD
             } else {
-                ASK_COLORS
-                    .get(cluster % ASK_COLORS.len())
-                    .cloned()
-                    .unwrap_or(Color32::GRAY)
+                ASK_COLORS.get(cluster % ASK_COLORS.len()).cloned().unwrap_or(Color32::GRAY)
             };
-            bars.push(
-                Bar::new(x, qty)
-                    .fill(color)
-                    .base_offset(offset)
-                    .width(step * 0.9),
-            );
+            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
             offset += qty;
         }
     }
-    for (i, (_, qty_deq)) in clustered_b.iter().enumerate() {
+    for (i, (_price, level_orders)) in clustered_b.into_iter().enumerate() {
         let x = -(i as f64 + 0.5) * step - 0.5;
         let mut offset = 0.0;
-        for &(qty, cluster) in qty_deq.iter() {
-            if qty <= 0.0 {
-                continue;
-            }
-            let color = if qty == max_bid {
+        for (qty, cluster) in level_orders {
+            let color = if qty == max_bid && qty > 0.0 {
                 Color32::GOLD
             } else {
-                BID_COLORS
-                    .get(cluster % BID_COLORS.len())
-                    .cloned()
-                    .unwrap_or(Color32::GRAY)
+                BID_COLORS.get(cluster % BID_COLORS.len()).cloned().unwrap_or(Color32::GRAY)
             };
-            bars.push(
-                Bar::new(x, qty)
-                    .fill(color)
-                    .base_offset(offset)
-                    .width(step * 0.9),
-            );
+            bars.push(Bar::new(x, qty).fill(color).base_offset(offset).width(step * 0.9));
             offset += qty;
         }
     }
     bars
-}
-
-fn nth_largest<'a>(iter: impl Iterator<Item = &'a (f64, VecDeque<f64>)>, n: usize) -> f64 {
-    let mut orders: Vec<f64> = iter.flat_map(|(_, dq)| dq.iter()).cloned().collect();
-    orders.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    orders.get(n).copied().unwrap_or(0.0)
 }

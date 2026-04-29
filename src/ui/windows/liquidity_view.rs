@@ -6,11 +6,21 @@ use egui_plot::{Line, Plot, PlotPoints};
 
 pub struct LiquidityView {
     open: bool,
+    last_refresh: std::time::Instant,
+    cached_buy_points: Vec<[f64; 2]>,
+    cached_sell_points: Vec<[f64; 2]>,
+    last_update_id: u64,
 }
 
 impl Default for LiquidityView {
     fn default() -> Self {
-        Self { open: true }
+        Self { 
+            open: true,
+            last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            cached_buy_points: Vec::new(),
+            cached_sell_points: Vec::new(),
+            last_update_id: 0,
+        }
     }
 }
 
@@ -26,24 +36,25 @@ impl AppWindow for LiquidityView {
     }
 
     fn show(&mut self, ctx: &egui::Context, state: &mut AppState<'_>) {
+        let mut open = self.open;
         egui::Window::new(self.name())
             .default_size(Vec2::new(480.0, 320.0))
             .resizable(false)
-            .open(&mut self.open)
+            .open(&mut open)
             .show(ctx, |ui| {
-                let (buy_points, sell_points) = state.order_book.get_liquidity_curves();
+                let now = std::time::Instant::now();
+                let force_refresh = now.duration_since(self.last_refresh).as_millis() > 200;
 
-                let buy_line = Line::new(
-                    "Buy",
-                    PlotPoints::from_iter(buy_points.iter().map(|p| [p.x, p.y])),
-                )
-                .color(Color32::BLUE);
+                if force_refresh || state.order_book.last_applied_u != self.last_update_id {
+                    let (buy_p, sell_p) = state.order_book.get_liquidity_curves();
+                    self.cached_buy_points = buy_p.iter().map(|p| [p.x, p.y]).collect();
+                    self.cached_sell_points = sell_p.iter().map(|p| [p.x, p.y]).collect();
+                    self.last_update_id = state.order_book.last_applied_u;
+                    self.last_refresh = now;
+                }
 
-                let sell_line = Line::new(
-                    "Sell",
-                    PlotPoints::from_iter(sell_points.iter().map(|p| [p.x, p.y])),
-                )
-                .color(Color32::RED);
+                let buy_line = Line::new("Buy", PlotPoints::new(self.cached_buy_points.clone())).color(Color32::BLUE);
+                let sell_line = Line::new("Sell", PlotPoints::new(self.cached_sell_points.clone())).color(Color32::RED);
 
                 ui.allocate_ui(egui::Vec2::new(480.0, 320.0), |ui| {
                     Plot::new("liquidity_cost_plot")
@@ -77,5 +88,6 @@ impl AppWindow for LiquidityView {
                     ));
                 });
             });
+        self.open = open;
     }
 }
