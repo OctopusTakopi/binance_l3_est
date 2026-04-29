@@ -513,9 +513,14 @@ async fn connect_futures_json(
                         }
                     }
 
-                    if needs_repaint && last_repaint.elapsed() > repaint_interval {
-                        ctx_clone.request_repaint();
-                        last_repaint = std::time::Instant::now();
+                    if needs_repaint {
+                        let elapsed = last_repaint.elapsed();
+                        if elapsed >= repaint_interval {
+                            ctx_clone.request_repaint();
+                            last_repaint = std::time::Instant::now();
+                        } else {
+                            ctx_clone.request_repaint_after(repaint_interval - elapsed);
+                        }
                     }
                 }
                 Ok(WsMessage::Ping(payload)) => {
@@ -575,23 +580,32 @@ async fn connect_spot_sbe(
                         for trade in trades {
                             let _ = tx_clone.send(AppMessage::Trade { market, trade });
                         }
-                        if last_repaint.elapsed() > repaint_interval {
+                        let elapsed = last_repaint.elapsed();
+                        if elapsed >= repaint_interval {
                             ctx_clone.request_repaint();
                             last_repaint = std::time::Instant::now();
+                        } else {
+                            ctx_clone.request_repaint_after(repaint_interval - elapsed);
                         }
                     }
                     Some(SpotSbeEvent::BestBidAsk(ticker)) => {
                         let _ = tx_clone.send(AppMessage::Ticker { market, ticker });
-                        if last_repaint.elapsed() > repaint_interval {
+                        let elapsed = last_repaint.elapsed();
+                        if elapsed >= repaint_interval {
                             ctx_clone.request_repaint();
                             last_repaint = std::time::Instant::now();
+                        } else {
+                            ctx_clone.request_repaint_after(repaint_interval - elapsed);
                         }
                     }
                     Some(SpotSbeEvent::DepthDiff(update)) => {
                         let _ = tx_clone.send(AppMessage::Update { market, update });
-                        if last_repaint.elapsed() > repaint_interval {
+                        let elapsed = last_repaint.elapsed();
+                        if elapsed >= repaint_interval {
                             ctx_clone.request_repaint();
                             last_repaint = std::time::Instant::now();
+                        } else {
+                            ctx_clone.request_repaint_after(repaint_interval - elapsed);
                         }
                     }
                     None => {}

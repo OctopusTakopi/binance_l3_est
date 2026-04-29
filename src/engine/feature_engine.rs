@@ -78,12 +78,11 @@ impl FeatureEngine {
 
         if trade.is_buyer_maker {
             let is_tob = trade_ticks == best_bid;
-            // For now, let's just use a simple check for in_top20
-            let in_top20 = book.iter_bids().take(20).any(|(p, _)| p == trade_ticks);
+            let in_top20 = book.is_in_top_n(trade_ticks, 20, true);
             self.metrics.on_fill(Side::Bid, is_tob, in_top20, qty);
         } else {
             let is_tob = trade_ticks == best_ask;
-            let in_top20 = book.iter_asks().take(20).any(|(p, _)| p == trade_ticks);
+            let in_top20 = book.is_in_top_n(trade_ticks, 20, false);
             self.metrics.on_fill(Side::Ask, is_tob, in_top20, qty);
         }
 

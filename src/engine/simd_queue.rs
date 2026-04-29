@@ -32,7 +32,7 @@ pub struct GlobalOrderPool {
 impl GlobalOrderPool {
     pub fn new(capacity: usize) -> Self {
         Self {
-            pool: vec![OrderBlock::default(); capacity],
+            pool: Vec::with_capacity(capacity),
             free_head: NULL_BLOCK,
         }
     }
@@ -172,29 +172,27 @@ impl QueuePtrs {
 
     #[inline(always)]
     pub fn pop_back(&mut self, pool: &mut GlobalOrderPool) -> Option<u64> {
-        if self.head_block == NULL_BLOCK || (self.head_block == self.tail_block && self.head_offset == self.tail_offset) {
-            return None;
-        }
-
-        if self.tail_offset > 0 {
-            self.tail_offset -= 1;
-            let val = pool.get_block(self.tail_block).sizes[self.tail_offset as usize];
-            pool.get_block_mut(self.tail_block).sizes[self.tail_offset as usize] = 0;
-            Some(val)
-        } else {
-            let prev = pool.get_block(self.tail_block).prev_block_idx;
-            if prev != NULL_BLOCK {
-                pool.free_block(self.tail_block);
-                self.tail_block = prev;
-                pool.get_block_mut(self.tail_block).next_block_idx = NULL_BLOCK;
-                self.tail_offset = 3;
-                let val = pool.get_block(self.tail_block).sizes[3];
-                pool.get_block_mut(self.tail_block).sizes[3] = 0;
-                Some(val)
+        while self.head_block != NULL_BLOCK && !(self.head_block == self.tail_block && self.head_offset == self.tail_offset) {
+            if self.tail_offset > 0 {
+                self.tail_offset -= 1;
+                let val = pool.get_block(self.tail_block).sizes[self.tail_offset as usize];
+                if val > 0 {
+                    pool.get_block_mut(self.tail_block).sizes[self.tail_offset as usize] = 0;
+                    return Some(val);
+                }
             } else {
-                None
+                let prev = pool.get_block(self.tail_block).prev_block_idx;
+                if prev != NULL_BLOCK {
+                    pool.free_block(self.tail_block);
+                    self.tail_block = prev;
+                    pool.get_block_mut(self.tail_block).next_block_idx = NULL_BLOCK;
+                    self.tail_offset = 4;
+                } else {
+                    break;
+                }
             }
         }
+        None
     }
 
     pub fn total_qty(&self, pool: &GlobalOrderPool) -> u64 {

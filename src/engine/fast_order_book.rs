@@ -74,6 +74,13 @@ impl Bitset {
     }
 
     #[inline(always)]
+    pub fn is_set(&self, idx: usize) -> bool {
+        if idx >= WINDOW_SIZE { return false; }
+        let i2 = idx >> 6;
+        (self.l2[i2] & (1u64 << (idx & 63))) != 0
+    }
+
+    #[inline(always)]
     pub fn find_next(&self, start_idx: usize) -> Option<usize> {
         if start_idx >= WINDOW_SIZE { return None; }
         
@@ -115,6 +122,9 @@ impl Bitset {
 
     #[inline(always)]
     pub fn find_prev(&self, start_idx: usize) -> Option<usize> {
+        if start_idx >= WINDOW_SIZE {
+            return self.find_last();
+        }
         let i2_idx = start_idx >> 6;
         let bit_in_i2 = start_idx & 63;
         
@@ -181,6 +191,7 @@ pub struct FastOrderBook {
     pub base_price_ticks: i64,
     pub pool: GlobalOrderPool,
     pub tick_size: f64,
+    pub initialized: bool,
 }
 
 impl FastOrderBook {
@@ -194,6 +205,24 @@ impl FastOrderBook {
             base_price_ticks: base_ticks,
             pool: GlobalOrderPool::new(100000),
             tick_size,
+            initialized: false,
+        }
+    }
+
+    /// Reset the level at `idx` if the opposite side currently owns it.
+    /// Prevents stale qty/queue from leaking across a bid<->ask transition.
+    #[inline(always)]
+    pub fn ensure_side(&mut self, idx: usize, is_bid: bool) {
+        let opposite_set = if is_bid {
+            self.asks_bitset.is_set(idx)
+        } else {
+            self.bids_bitset.is_set(idx)
+        };
+        if opposite_set {
+            self.bids_bitset.clear(idx);
+            self.asks_bitset.clear(idx);
+            self.total_qtys[idx] = 0;
+            self.clear_queue(idx);
         }
     }
 
@@ -234,6 +263,8 @@ impl FastOrderBook {
             None => return,
         };
 
+        self.ensure_side(idx, is_bid);
+
         let old_total = self.total_qtys[idx];
         if new_total_u64 > old_total {
             let diff = new_total_u64 - old_total;
@@ -244,10 +275,8 @@ impl FastOrderBook {
             self.total_qtys[idx] = new_total_u64;
             if is_bid {
                 self.bids_bitset.set(idx);
-                self.asks_bitset.clear(idx);
             } else {
                 self.asks_bitset.set(idx);
-                self.bids_bitset.clear(idx);
             }
         } else if new_total_u64 < old_total {
             let mut to_remove = old_total - new_total_u64;
@@ -272,15 +301,18 @@ impl FastOrderBook {
     pub fn slide_window(&mut self, target_ticks: i64, force: bool) {
         let current_center = self.base_price_ticks + (WINDOW_SIZE as i64 / 2);
         let diff = (target_ticks - current_center).abs();
-        
-        if !force && diff < (WINDOW_SIZE as i64 / 4) && self.base_price_ticks != 0 {
+
+        if !force && self.initialized && diff < (WINDOW_SIZE as i64 / 4) {
             return;
         }
 
         let new_base = target_ticks - (WINDOW_SIZE as i64 / 2);
         let shift = new_base - self.base_price_ticks;
-        
-        if shift == 0 { return; }
+
+        if shift == 0 {
+            self.initialized = true;
+            return;
+        }
 
         if shift.abs() >= WINDOW_SIZE as i64 {
             self.reset_with_base(new_base);
@@ -321,6 +353,7 @@ impl FastOrderBook {
         self.base_price_ticks = new_base;
         self.bids_bitset.rebuild_hierarchies();
         self.asks_bitset.rebuild_hierarchies();
+        self.initialized = true;
     }
 
     fn shift_bitset_left(bs: &mut Bitset, amount: usize) {
@@ -379,6 +412,7 @@ impl FastOrderBook {
             self.clear_queue(i);
         }
         self.total_qtys.fill(0);
+        self.initialized = true;
     }
 
     pub fn best_bid(&self) -> Option<i64> {

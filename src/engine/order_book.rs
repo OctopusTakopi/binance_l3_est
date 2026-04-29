@@ -292,6 +292,15 @@ impl OrderBook {
         let best_bid_ticks = self.price_to_ticks(ticker.best_bid_price);
         let best_ask_ticks = self.price_to_ticks(ticker.best_ask_price);
 
+        // Re-center the window if the ticker prices fall outside it; otherwise the
+        // overlay would be silently dropped by reconcile_level.
+        if self.book.get_idx(best_bid_ticks).is_none()
+            || self.book.get_idx(best_ask_ticks).is_none()
+        {
+            let mid_ticks = (best_bid_ticks + best_ask_ticks) / 2;
+            self.book.slide_window(mid_ticks, true);
+        }
+
         // Clear bids above best_bid_ticks and asks below best_ask_ticks
         // In BTreeMap this was split_off. In FastOrderBook, we can just clear the bitset range.
         self.clear_bids_above(best_bid_ticks);
@@ -324,6 +333,7 @@ impl OrderBook {
         while let Some(i) = curr {
             self.book.total_qtys[i] = 0;
             self.book.bids_bitset.clear(i);
+            self.book.asks_bitset.clear(i);
             self.book.clear_queue(i);
             curr = self.book.bids_bitset.find_next(i + 1);
         }
@@ -334,7 +344,7 @@ impl OrderBook {
         let end_idx = if rel < 0 {
             return; // No asks are below
         } else if rel >= crate::engine::fast_order_book::WINDOW_SIZE as i64 {
-            crate::engine::fast_order_book::WINDOW_SIZE 
+            crate::engine::fast_order_book::WINDOW_SIZE
         } else {
             rel as usize
         };
@@ -345,6 +355,7 @@ impl OrderBook {
             if i >= end_idx { break; }
             self.book.total_qtys[i] = 0;
             self.book.asks_bitset.clear(i);
+            self.book.bids_bitset.clear(i);
             self.book.clear_queue(i);
             curr = self.book.asks_bitset.find_next(i + 1);
         }
@@ -355,6 +366,10 @@ impl OrderBook {
             Some(i) => i,
             None => return,
         };
+
+        // If the level is currently on the opposite side, wipe it before applying ticker.
+        // After ensure_side, est_total may be reset to 0, falling into the fresh-level path.
+        self.book.ensure_side(idx, is_bid);
 
         let ticker_qty_u64 = self.book.f64_to_u64(ticker_qty);
         let est_total = self.book.total_qtys[idx];
@@ -373,15 +388,64 @@ impl OrderBook {
                     }
                 }
                 self.book.total_qtys[idx] = ticker_qty_u64;
-            } else if ticker_qty_u64 > est_total {
-                if self.book.queues[idx].head_block == crate::engine::simd_queue::NULL_BLOCK {
-                    self.book.queues[idx] = crate::engine::simd_queue::QueuePtrs::new(&mut self.book.pool);
+                if is_bid {
+                    self.book.bids_bitset.set(idx);
+                } else {
+                    self.book.asks_bitset.set(idx);
                 }
+            } else if ticker_qty_u64 > est_total {
                 self.book.queues[idx].push_back(&mut self.book.pool, ticker_qty_u64 - est_total);
                 self.book.total_qtys[idx] = ticker_qty_u64;
+                if is_bid {
+                    self.book.bids_bitset.set(idx);
+                } else {
+                    self.book.asks_bitset.set(idx);
+                }
             }
         } else {
             self.book.process_update(price_ticks, ticker_qty, is_bid);
+        }
+    }
+
+    /// Whether `price_ticks` is in the top-N levels of the given side, treating the
+    /// query as a hypothetical insert: it returns true if `price_ticks` already
+    /// exists in the top-N OR if it would land in top-N when inserted (i.e. fewer
+    /// than N existing levels strictly outrank it).
+    pub fn is_in_top_n(&self, price_ticks: i64, n: usize, is_bid: bool) -> bool {
+        if n == 0 { return false; }
+        if is_bid {
+            // Bids rank by descending price; walk down from best_bid.
+            let mut curr = self.book.best_bid();
+            for _ in 0..n {
+                match curr {
+                    None => return true,                      // fewer than n bids exist
+                    Some(ticks) if ticks == price_ticks => return true,
+                    Some(ticks) if ticks < price_ticks => return true, // walked past it
+                    Some(ticks) => {
+                        let idx = self.book.get_idx(ticks).unwrap();
+                        if idx == 0 { return true; }
+                        curr = self.book.bids_bitset.find_prev(idx - 1)
+                            .map(|i| self.book.base_price_ticks + i as i64);
+                    }
+                }
+            }
+            false
+        } else {
+            // Asks rank by ascending price; walk up from best_ask.
+            let mut curr = self.book.best_ask();
+            for _ in 0..n {
+                match curr {
+                    None => return true,
+                    Some(ticks) if ticks == price_ticks => return true,
+                    Some(ticks) if ticks > price_ticks => return true,
+                    Some(ticks) => {
+                        let idx = self.book.get_idx(ticks).unwrap();
+                        curr = self.book.asks_bitset.find_next(idx + 1)
+                            .map(|i| self.book.base_price_ticks + i as i64);
+                    }
+                }
+            }
+            false
         }
     }
 
@@ -399,24 +463,39 @@ impl OrderBook {
             self.best_ask_ticks.map_or(true, |best| price_ticks <= best)
         };
         
-        // top 20 check is harder with flat array, but we can do it via bitset
-        // For now, let's just approximate or keep it if needed.
-        let in_top20 = true; // Placeholder for now
+        let in_top20 = self.is_in_top_n(price_ticks, 20, is_bid);
 
         let idx = match self.book.get_idx(price_ticks) {
             Some(i) => i,
             None => {
-                // If it's the TOP of the book and it's outside our window, we SHOULD slide.
-                // But for now, let's just ignore far-away levels to maintain stability.
-                return LevelChangeResult {
-                    inflow: 0.0,
-                    cancel: 0.0,
-                    is_tob,
-                    in_top20,
-                    is_bid,
-                };
+                // Bootstrap the window the first time we see a price; the book has no
+                // anchor yet so center on this update. Subsequent out-of-window prices
+                // are dropped (lazy re-centering handles intra-window drift).
+                if !self.book.initialized {
+                    self.book.slide_window(price_ticks, true);
+                    match self.book.get_idx(price_ticks) {
+                        Some(i) => i,
+                        None => return LevelChangeResult {
+                            inflow: 0.0,
+                            cancel: 0.0,
+                            is_tob,
+                            in_top20,
+                            is_bid,
+                        },
+                    }
+                } else {
+                    return LevelChangeResult {
+                        inflow: 0.0,
+                        cancel: 0.0,
+                        is_tob,
+                        in_top20,
+                        is_bid,
+                    };
+                }
             }
         };
+
+        self.book.ensure_side(idx, is_bid);
 
         let new_total_u64 = self.book.f64_to_u64(new_total_qty);
         let old_total = self.book.total_qtys[idx];
@@ -432,9 +511,6 @@ impl OrderBook {
                         let num_fragments = (diff as f64 / avg_trade_u64 as f64).clamp(2.0, 5.0) as usize;
                         let fragment_val = diff / num_fragments as u64;
                         let mut remaining = diff;
-                        if self.book.queues[idx].head_block == crate::engine::simd_queue::NULL_BLOCK {
-                            self.book.queues[idx] = crate::engine::simd_queue::QueuePtrs::new(&mut self.book.pool);
-                        }
                         for i in 0..num_fragments {
                             if i == num_fragments - 1 {
                                 self.book.queues[idx].push_back(&mut self.book.pool, remaining);
@@ -444,25 +520,17 @@ impl OrderBook {
                             }
                         }
                     } else {
-                        if self.book.queues[idx].head_block == crate::engine::simd_queue::NULL_BLOCK {
-                            self.book.queues[idx] = crate::engine::simd_queue::QueuePtrs::new(&mut self.book.pool);
-                        }
                         self.book.queues[idx].push_back(&mut self.book.pool, diff);
                     }
                 } else {
-                    if self.book.queues[idx].head_block == crate::engine::simd_queue::NULL_BLOCK {
-                        self.book.queues[idx] = crate::engine::simd_queue::QueuePtrs::new(&mut self.book.pool);
-                    }
                     self.book.queues[idx].push_back(&mut self.book.pool, diff);
                 }
 
                 self.book.total_qtys[idx] = new_total_u64;
                 if is_bid {
                     self.book.bids_bitset.set(idx);
-                    self.book.asks_bitset.clear(idx);
                 } else {
                     self.book.asks_bitset.set(idx);
-                    self.book.bids_bitset.clear(idx);
                 }
 
                 return LevelChangeResult {
@@ -480,15 +548,6 @@ impl OrderBook {
                     while let Some(trade) = trade_deq.front_mut() {
                         if ts >= trade.transaction_time && ts - trade.transaction_time < 1000 {
                             let trade_qty_u64 = self.book.f64_to_u64(trade.quantity);
-                            
-                            // Ensure first order in queue is at least as large as the trade
-                            if !self.book.queues[idx].is_empty(&mut self.book.pool) {
-                                let first = self.book.queues[idx].first_size(&mut self.book.pool);
-                                if first < trade_qty_u64 {
-                                    self.book.queues[idx].mut_first_size(&mut self.book.pool, |s| *s = trade_qty_u64);
-                                }
-                            }
-
                             let consumed = trade_qty_u64.min(remaining_to_remove);
 
                             let mut inner_remaining = consumed;
@@ -535,10 +594,8 @@ impl OrderBook {
                         self.book.total_qtys[idx] = new_total_u64;
                         if is_bid {
                             self.book.bids_bitset.set(idx);
-                            self.book.asks_bitset.clear(idx);
                         } else {
                             self.book.asks_bitset.set(idx);
-                            self.book.bids_bitset.clear(idx);
                         }
                     }
 
@@ -586,10 +643,8 @@ impl OrderBook {
                         self.book.total_qtys[idx] = new_total_u64;
                         if is_bid {
                             self.book.bids_bitset.set(idx);
-                            self.book.asks_bitset.clear(idx);
                         } else {
                             self.book.asks_bitset.set(idx);
-                            self.book.bids_bitset.clear(idx);
                         }
                     }
 
