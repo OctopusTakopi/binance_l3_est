@@ -30,6 +30,9 @@ impl Bitset {
     pub fn set(&mut self, idx: usize) {
         let i2 = idx >> 6;
         let b2 = 1u64 << (idx & 63);
+        if self.l2[i2] & b2 != 0 {
+            return;
+        }
         self.l2[i2] |= b2;
 
         let i1 = i2 >> 6;
@@ -87,6 +90,106 @@ impl Bitset {
         }
         let i2 = idx >> 6;
         (self.l2[i2] & (1u64 << (idx & 63))) != 0
+    }
+
+    /// Count occupied indices strictly below `idx`, stopping at `limit`.
+    #[inline]
+    pub fn count_below_limited(&self, idx: usize, limit: usize) -> usize {
+        if idx == 0 || limit == 0 {
+            return 0;
+        }
+
+        let mut word_idx = (idx.min(WINDOW_SIZE) - 1) >> 6;
+        let end_bit = idx.min(WINDOW_SIZE) & 63;
+        let mut word = self.l2[word_idx];
+        if end_bit != 0 {
+            word &= (1u64 << end_bit) - 1;
+        }
+        let mut count = word.count_ones() as usize;
+
+        while count < limit && word_idx > 0 {
+            word_idx -= 1;
+            count += self.l2[word_idx].count_ones() as usize;
+        }
+        count.min(limit)
+    }
+
+    /// Count occupied indices strictly above `idx`, stopping at `limit`.
+    #[inline]
+    pub fn count_above_limited(&self, idx: usize, limit: usize) -> usize {
+        if idx >= WINDOW_SIZE - 1 || limit == 0 {
+            return 0;
+        }
+
+        let mut word_idx = idx >> 6;
+        let bit = idx & 63;
+        let mut count = if bit == 63 {
+            0
+        } else {
+            (self.l2[word_idx] & (!0u64 << (bit + 1))).count_ones() as usize
+        };
+
+        while count < limit && word_idx + 1 < self.l2.len() {
+            word_idx += 1;
+            count += self.l2[word_idx].count_ones() as usize;
+        }
+        count.min(limit)
+    }
+
+    #[inline]
+    pub fn count_limited(&self, limit: usize) -> usize {
+        let mut count = 0;
+        for &word in &self.l2 {
+            count += word.count_ones() as usize;
+            if count >= limit {
+                return limit;
+            }
+        }
+        count
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn count_below_limited_popcnt(&self, idx: usize, limit: usize) -> usize {
+        if idx == 0 || limit == 0 {
+            return 0;
+        }
+
+        let mut word_idx = (idx.min(WINDOW_SIZE) - 1) >> 6;
+        let end_bit = idx.min(WINDOW_SIZE) & 63;
+        let mut word = self.l2[word_idx];
+        if end_bit != 0 {
+            word &= (1u64 << end_bit) - 1;
+        }
+        let mut count = word.count_ones() as usize;
+
+        while count < limit && word_idx > 0 {
+            word_idx -= 1;
+            count += self.l2[word_idx].count_ones() as usize;
+        }
+        count.min(limit)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn count_above_limited_popcnt(&self, idx: usize, limit: usize) -> usize {
+        if idx >= WINDOW_SIZE - 1 || limit == 0 {
+            return 0;
+        }
+
+        let mut word_idx = idx >> 6;
+        let bit = idx & 63;
+        let mut count = if bit == 63 {
+            0
+        } else {
+            (self.l2[word_idx] & (!0u64 << (bit + 1))).count_ones() as usize
+        };
+
+        while count < limit && word_idx + 1 < self.l2.len() {
+            word_idx += 1;
+            count += self.l2[word_idx].count_ones() as usize;
+        }
+        count.min(limit)
     }
 
     #[inline(always)]
@@ -207,6 +310,8 @@ pub struct FastOrderBook {
     pub pool: GlobalOrderPool,
     pub tick_size: f64,
     pub initialized: bool,
+    #[cfg(target_arch = "x86_64")]
+    popcnt_available: bool,
 }
 
 impl FastOrderBook {
@@ -221,6 +326,35 @@ impl FastOrderBook {
             pool: GlobalOrderPool::new(100000),
             tick_size,
             initialized: false,
+            #[cfg(target_arch = "x86_64")]
+            popcnt_available: std::arch::is_x86_feature_detected!("popcnt"),
+        }
+    }
+
+    #[inline(always)]
+    pub fn count_outranking(
+        &self,
+        bitset: &Bitset,
+        idx: usize,
+        limit: usize,
+        above: bool,
+    ) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if self.popcnt_available {
+            // SAFETY: support is detected once when the book is constructed.
+            return unsafe {
+                if above {
+                    bitset.count_above_limited_popcnt(idx, limit)
+                } else {
+                    bitset.count_below_limited_popcnt(idx, limit)
+                }
+            };
+        }
+
+        if above {
+            bitset.count_above_limited(idx, limit)
+        } else {
+            bitset.count_below_limited(idx, limit)
         }
     }
 
@@ -429,11 +563,18 @@ impl FastOrderBook {
 
     pub fn reset_with_base(&mut self, new_base: i64) {
         self.base_price_ticks = new_base;
+        // Queue ownership follows occupancy, so scan the compact bitmap rather
+        // than all 65,536 price slots. This keeps snapshot/gap recovery cheap.
+        for word_idx in 0..self.bids_bitset.l2.len() {
+            let mut occupied = self.bids_bitset.l2[word_idx] | self.asks_bitset.l2[word_idx];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                self.clear_queue((word_idx << 6) + bit);
+                occupied &= occupied - 1;
+            }
+        }
         self.bids_bitset.reset();
         self.asks_bitset.reset();
-        for i in 0..WINDOW_SIZE {
-            self.clear_queue(i);
-        }
         self.total_qtys.fill(0);
         self.initialized = true;
     }
@@ -448,5 +589,73 @@ impl FastOrderBook {
         self.asks_bitset
             .find_first()
             .map(|idx| self.base_price_ticks + idx as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitset_hierarchy_survives_idempotent_updates_and_clears() {
+        let mut bitset = Bitset::new();
+        for idx in [0, 63, 64, 4095, WINDOW_SIZE - 1] {
+            bitset.set(idx);
+            bitset.set(idx);
+        }
+
+        assert_eq!(bitset.find_first(), Some(0));
+        assert_eq!(bitset.find_last(), Some(WINDOW_SIZE - 1));
+        assert_eq!(bitset.find_next(1), Some(63));
+        assert_eq!(bitset.find_prev(WINDOW_SIZE - 2), Some(4095));
+        assert_eq!(bitset.count_below_limited(64, 20), 2);
+        assert_eq!(bitset.count_above_limited(64, 20), 2);
+        assert_eq!(bitset.count_below_limited(4095, 1), 1);
+        assert_eq!(bitset.count_above_limited(63, 1), 1);
+
+        for idx in [0, 63, 64, 4095, WINDOW_SIZE - 1] {
+            bitset.clear(idx);
+        }
+        assert_eq!(bitset.find_first(), None);
+        assert_eq!(bitset.l0, 0);
+    }
+
+    #[test]
+    fn sparse_reset_reclaims_queues() {
+        let mut book = FastOrderBook::new(1.0, 100.0);
+        book.process_update(100, 1.0, true);
+        book.process_update(101, 2.0, false);
+
+        book.reset_with_base(book.base_price_ticks);
+
+        assert!(book.best_bid().is_none());
+        assert!(book.best_ask().is_none());
+        assert!(book.total_qtys.iter().all(|&qty| qty == 0));
+    }
+
+    #[test]
+    fn limited_rank_counts_match_scalar_reference() {
+        let occupied = [0, 2, 63, 64, 65, 127, 191, 255];
+        let mut bitset = Bitset::new();
+        for idx in occupied {
+            bitset.set(idx);
+        }
+
+        for idx in 0..=256 {
+            for limit in [1, 3, 20] {
+                let below = occupied
+                    .iter()
+                    .filter(|&&value| value < idx)
+                    .count()
+                    .min(limit);
+                let above = occupied
+                    .iter()
+                    .filter(|&&value| value > idx)
+                    .count()
+                    .min(limit);
+                assert_eq!(bitset.count_below_limited(idx, limit), below);
+                assert_eq!(bitset.count_above_limited(idx, limit), above);
+            }
+        }
     }
 }

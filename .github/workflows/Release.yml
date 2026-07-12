@@ -1,29 +1,33 @@
-name: Release
+name: CI and Release
 
 on:
+  pull_request:
   push:
+    branches:
+      - main
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        rust: [stable]
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies
@@ -33,55 +37,59 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --release
+        run: cargo test --locked --all-targets
 
-      - name: Build release
-        run: cargo build --release
+      - name: Build GPU-enabled release binary
+        run: cargo build --locked --release
 
-      - name: Set binary extension
-        id: set-ext
+      - name: Stage binary
+        id: stage
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            echo "extension=.exe" >> $GITHUB_OUTPUT
-            echo "binary_path=target/release/binance_l3_est.exe" >> $GITHUB_OUTPUT
-          else
-            echo "extension=" >> $GITHUB_OUTPUT
-            echo "binary_path=target/release/binance_l3_est" >> $GITHUB_OUTPUT
+          extension=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            extension=".exe"
           fi
-        shell: bash
+          asset="binance_l3_est-${{ runner.os }}-${{ runner.arch }}${extension}"
+          mkdir -p dist
+          cp "target/release/binance_l3_est${extension}" "dist/${asset}"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
-      - name: Rename binary (non-Windows)
-        if: runner.os != 'Windows'
-        run: |
-          mv -f ${{ steps.set-ext.outputs.binary_path }} target/release/binance_l3_est-${{ runner.os }}-${{ runner.arch }}${{ steps.set-ext.outputs.extension }}
-        shell: bash
-
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          $dest = "target/release/binance_l3_est-${{ runner.os }}-${{ runner.arch }}${{ steps.set-ext.outputs.extension }}"
-          if (Test-Path $dest) { Remove-Item $dest -Force }
-          Rename-Item -Path "${{ steps.set-ext.outputs.binary_path }}" -NewName "binance_l3_est-${{ runner.os }}-${{ runner.arch }}${{ steps.set-ext.outputs.extension }}"
-        shell: pwsh
-
-      - name: Upload binaries as artifacts
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ runner.os }}
-          path: target/release/binance_l3_est-${{ runner.os }}-${{ runner.arch }}${{ steps.set-ext.outputs.extension }}
+          name: ${{ steps.stage.outputs.asset }}
+          path: dist/${{ steps.stage.outputs.asset }}
+          if-no-files-found: error
 
-      - name: Create and upload release assets
-        if: github.event_name == 'push'
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/binance_l3_est-${{ runner.os }}-${{ runner.arch }}${{ steps.set-ext.outputs.extension }}
+          files: dist/*
           generate_release_notes: true
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,6 +1,6 @@
 //! Mini-batch K-Means clustering for order book quantity levels.
 
-use rand::Rng;
+use rand::RngExt;
 use std::cmp::Ordering;
 
 /// Upper bound on the number of clusters. All inline arrays are sized to this.

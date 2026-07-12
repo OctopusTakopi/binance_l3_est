@@ -14,6 +14,8 @@ pub struct TwapView {
     last_psd_len_sell: usize,
     last_peaks_len_buy: usize,
     last_peaks_len_sell: usize,
+    last_update_id_buy: u64,
+    last_update_id_sell: u64,
 }
 
 impl AppWindow for TwapView {
@@ -77,7 +79,8 @@ impl AppWindow for TwapView {
                 }
 
                 if !twap.psd_buy.is_empty() {
-                    if twap.psd_buy.len() != self.last_psd_len_buy
+                    if twap.update_id != self.last_update_id_buy
+                        || twap.psd_buy.len() != self.last_psd_len_buy
                         || twap.peaks_buy.len() != self.last_peaks_len_buy
                     {
                         self.cached_bars_buy = build_psd_bars(
@@ -87,6 +90,7 @@ impl AppWindow for TwapView {
                         );
                         self.last_psd_len_buy = twap.psd_buy.len();
                         self.last_peaks_len_buy = twap.peaks_buy.len();
+                        self.last_update_id_buy = twap.update_id;
                     }
 
                     render_psd_cached(
@@ -104,7 +108,8 @@ impl AppWindow for TwapView {
                 ui.separator();
 
                 if !twap.psd_sell.is_empty() {
-                    if twap.psd_sell.len() != self.last_psd_len_sell
+                    if twap.update_id != self.last_update_id_sell
+                        || twap.psd_sell.len() != self.last_psd_len_sell
                         || twap.peaks_sell.len() != self.last_peaks_len_sell
                     {
                         self.cached_bars_sell = build_psd_bars(
@@ -114,6 +119,7 @@ impl AppWindow for TwapView {
                         );
                         self.last_psd_len_sell = twap.psd_sell.len();
                         self.last_peaks_len_sell = twap.peaks_sell.len();
+                        self.last_update_id_sell = twap.update_id;
                     }
 
                     render_psd_cached(

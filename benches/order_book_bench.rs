@@ -1,6 +1,7 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
+use std::hint::black_box;
 
 use binance_l3_est::engine::order_book::OrderBook;
 use binance_l3_est::types::{DepthUpdate, OrderBookSnapshot};

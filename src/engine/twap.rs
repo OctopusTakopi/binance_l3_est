@@ -51,6 +51,8 @@ pub struct TwapDetector {
     /// One-sided PSD for taker-buy USD volume signal (amplitude estimation).
     pub psd_vol_buy: Vec<[f64; 2]>,
     pub psd_vol_sell: Vec<[f64; 2]>,
+    /// Increments whenever FFT-visible state changes; used by UI caches.
+    pub update_id: u64,
 
     // ── Internal compute state ─────────────────────────────────────────────
     /// Planners are expensive to allocate (twiddle factors).
@@ -85,6 +87,7 @@ impl TwapDetector {
             peaks_sell: Vec::new(),
             psd_vol_buy: Vec::new(),
             psd_vol_sell: Vec::new(),
+            update_id: 0,
             planner: FftPlanner::<f64>::new(),
             fft_buffer: Vec::with_capacity(1024),
         }
@@ -108,6 +111,7 @@ impl TwapDetector {
         self.current_vol_buy = 0.0;
         self.current_vol_sell = 0.0;
         self.bins_since_fft = 0;
+        self.update_id = self.update_id.wrapping_add(1);
     }
 
     /// Reset only the bin-parameter-sensitive fields (called when `bin_ms` slider
@@ -115,14 +119,21 @@ impl TwapDetector {
     pub fn reset_bins(&mut self) {
         self.bins_buy.clear();
         self.bins_sell.clear();
+        self.vol_bins_buy.clear();
+        self.vol_bins_sell.clear();
         self.psd_buy.clear();
         self.psd_sell.clear();
+        self.psd_vol_buy.clear();
+        self.psd_vol_sell.clear();
         self.peaks_buy.clear();
         self.peaks_sell.clear();
         self.current_bin_start = 0;
         self.current_bin_buy = 0;
         self.current_bin_sell = 0;
+        self.current_vol_buy = 0.0;
+        self.current_vol_sell = 0.0;
         self.bins_since_fft = 0;
+        self.update_id = self.update_id.wrapping_add(1);
     }
 
     // ── Trade ingestion ────────────────────────────────────────────────────────
@@ -131,8 +142,19 @@ impl TwapDetector {
     /// time window has elapsed, then optionally run the FFT pipeline.
     pub fn on_trade(&mut self, trade: &Trade) {
         let ts = trade.transaction_time;
+        let bin_ms = self.bin_ms.max(1);
         if self.current_bin_start == 0 {
-            self.current_bin_start = ts;
+            self.current_bin_start = ts - ts % bin_ms;
+        } else if ts.saturating_sub(self.current_bin_start) >= bin_ms {
+            let elapsed_bins = ts.saturating_sub(self.current_bin_start) / bin_ms;
+            self.close_bin();
+
+            // Preserve the time axis across quiet periods, bounded by the
+            // configured window so a large timestamp jump remains cheap.
+            for _ in 1..elapsed_bins.min(self.window_bins as u64) {
+                self.close_bin();
+            }
+            self.current_bin_start = ts - ts % bin_ms;
         }
 
         let notional = trade.quantity * trade.price;
@@ -143,10 +165,6 @@ impl TwapDetector {
         } else {
             self.current_bin_buy += 1;
             self.current_vol_buy += notional;
-        }
-
-        if ts.saturating_sub(self.current_bin_start) >= self.bin_ms {
-            self.close_bin();
         }
     }
 
@@ -218,6 +236,7 @@ impl TwapDetector {
             &mut self.psd_vol_buy,
             None,
         );
+        self.update_id = self.update_id.wrapping_add(1);
         Self::run_fft_pipeline(
             &self.vol_bins_sell,
             bin_ms,
@@ -337,5 +356,49 @@ fn push_capped(deq: &mut VecDeque<f64>, value: f64, cap: usize) {
     deq.push_back(value);
     if deq.len() > cap {
         deq.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::SymbolStr;
+
+    fn trade(id: u64, ts: u64) -> Trade {
+        Trade {
+            event_type: "trade".to_string(),
+            event_time: ts,
+            symbol: SymbolStr::from("BTCUSDT"),
+            trade_id: id,
+            price: 100.0,
+            quantity: 1.0,
+            order_type: "LIMIT".to_string(),
+            transaction_time: ts,
+            is_buyer_maker: false,
+        }
+    }
+
+    #[test]
+    fn boundary_trade_starts_the_new_bin() {
+        let mut detector = TwapDetector::new();
+        detector.bin_ms = 500;
+        detector.on_trade(&trade(1, 1_100));
+        detector.on_trade(&trade(2, 1_600));
+
+        assert_eq!(detector.bins_buy.back(), Some(&1.0));
+        assert_eq!(detector.current_bin_buy, 1);
+        assert_eq!(detector.current_bin_start, 1_500);
+    }
+
+    #[test]
+    fn bin_reset_clears_count_and_volume_state() {
+        let mut detector = TwapDetector::new();
+        detector.on_trade(&trade(1, 1_000));
+        detector.reset_bins();
+
+        assert!(detector.bins_buy.is_empty());
+        assert!(detector.vol_bins_buy.is_empty());
+        assert_eq!(detector.current_bin_buy, 0);
+        assert_eq!(detector.current_vol_buy, 0.0);
     }
 }

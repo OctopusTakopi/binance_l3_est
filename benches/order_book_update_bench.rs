@@ -1,8 +1,9 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
+use std::hint::black_box;
 
-use binance_l3_est::engine::order_book::OrderBook;
+use binance_l3_est::engine::order_book::{DepthUpdateStatus, OrderBook};
 use binance_l3_est::types::{DepthUpdate, OrderBookSnapshot};
 use binance_l3_est::utils::SymbolStr;
 
@@ -83,12 +84,18 @@ fn bench_process_update(c: &mut Criterion) {
     let mut ob = OrderBook::new(tick_size);
     ob.apply_snapshot(snapshot);
 
+    let mut i = 0;
+    let mut next_update_id = 1001_u64;
     c.bench_function("order_book_single_process_update", |b| {
-        let mut i = 0;
         b.iter(|| {
-            let update = &updates[i % updates.len()];
-            let _ = ob.process_update(black_box(update.clone()), 1.0);
+            let mut update = updates[i % updates.len()].clone();
+            update.capital_u = next_update_id;
+            update.small_u = next_update_id;
+            update.pu = Some(next_update_id - 1);
+            let status = ob.process_update(black_box(update), 1.0);
+            assert_eq!(status, Ok(DepthUpdateStatus::Applied));
             i += 1;
+            next_update_id += 1;
         })
     });
 }

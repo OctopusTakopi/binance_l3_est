@@ -339,24 +339,54 @@ pub async fn run_streaming_loop(
             endpoints.snapshot_base_url,
             symbol.to_uppercase()
         );
-        match reqwest::Client::new().get(&snap_url).send().await {
-            Ok(resp) => match resp.json::<OrderBookSnapshot>().await {
-                Ok(snap) => {
-                    log::info!("Snapshot fetched successfully.");
-                    let _ = tx.send(AppMessage::NetworkWarning {
-                        symbol: symbol.clone(),
-                        market,
-                        message: String::new(),
-                    });
-                    let _ = tx.send(AppMessage::Snapshot {
-                        symbol: symbol.clone(),
-                        market,
-                        snapshot: snap,
-                    });
-                }
-                Err(e) => log::error!("Snapshot JSON error: {e}"),
+        let snapshot_result = match reqwest::Client::new().get(&snap_url).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response.json::<OrderBookSnapshot>().await,
+                Err(error) => Err(error),
             },
-            Err(e) => log::error!("Snapshot request error: {e}"),
+            Err(error) => Err(error),
+        };
+
+        match snapshot_result {
+            Ok(snapshot) => {
+                log::info!("Snapshot fetched successfully.");
+                let _ = tx.send(AppMessage::NetworkWarning {
+                    symbol: symbol.clone(),
+                    market,
+                    message: String::new(),
+                });
+                let _ = tx.send(AppMessage::Snapshot {
+                    symbol: symbol.clone(),
+                    market,
+                    snapshot,
+                });
+            }
+            Err(error) => {
+                let message = format!("Snapshot request failed: {error}");
+                log::error!("{message}");
+                ws_handle.abort();
+                let _ = tx.send(AppMessage::NetworkWarning {
+                    symbol: symbol.clone(),
+                    market,
+                    message,
+                });
+                ctx.request_repaint();
+
+                tokio::select! {
+                    ctrl = control_rx.recv() => {
+                        match ctrl {
+                            Some(ctrl) => {
+                                if !apply_control(ctrl, &mut symbol, &mut market, &mut spot_api_key) {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = sleep(Duration::from_secs(2)) => {}
+                }
+                continue;
+            }
         }
 
         let mut ws_handle = ws_handle;
