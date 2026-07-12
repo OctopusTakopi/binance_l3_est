@@ -1,7 +1,6 @@
 /target
 .idea
 *~
-Cargo.lock
 **/*.rs.bk
 *.pdb
 **/mutants.out*/

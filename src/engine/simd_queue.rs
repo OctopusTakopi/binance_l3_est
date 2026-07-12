@@ -2,6 +2,7 @@
 use std::arch::x86_64::*;
 
 pub const NULL_BLOCK: u32 = u32::MAX;
+const MAX_EXACT_MATCH_BLOCKS: usize = 8;
 
 #[repr(align(32))]
 #[derive(Clone, Copy, Debug)]
@@ -235,32 +236,34 @@ impl QueuePtrs {
         }
     }
 
-    /// Find an order whose size exactly matches `target_size` and zero it in
-    /// place. Returns `true` if a match was found.
-    ///
-    /// On x86_64 this uses an AVX2 + BMI1 vector compare; on other
-    /// architectures it walks the queue scalarly. The `unsafe` qualifier is
-    /// kept on every target for signature parity (the SIMD path requires
-    /// AVX2/BMI1 at runtime).
-    ///
-    /// # Safety
-    ///
-    /// On x86_64 the CPU must support the AVX2 + BMI1 target features (the fn
-    /// is gated by `#[target_feature]` and can only be called on hardware
-    /// where those flags are present). On all targets the caller is
-    /// responsible for not aliasing `pool` elsewhere for the duration of the
-    /// call.
+    /// Search the most recent queue blocks for an order whose size exactly
+    /// matches `target_size` and zero it in place. The bounded search keeps
+    /// cancellation latency independent of queue age. AVX2 is selected at
+    /// runtime on x86_64; all other CPUs use the portable scalar path.
+    #[inline]
+    pub fn remove_order_by_size(&self, pool: &mut GlobalOrderPool, target_size: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the runtime check above satisfies the target feature
+            // requirement, and `pool` is exclusively borrowed here.
+            return unsafe { self.remove_order_by_size_avx2(pool, target_size) };
+        }
+
+        self.remove_order_by_size_scalar(pool, target_size)
+    }
+
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,bmi1")]
-    pub unsafe fn remove_order_by_size_simd(
+    #[target_feature(enable = "avx2")]
+    unsafe fn remove_order_by_size_avx2(
         &self,
         pool: &mut GlobalOrderPool,
         target_size: u64,
     ) -> bool {
-        let mut curr_block_idx = self.head_block;
+        let mut curr_block_idx = self.last_nonempty_block(pool);
         let target_vec = _mm256_set1_epi64x(target_size as i64);
+        let mut blocks_left = MAX_EXACT_MATCH_BLOCKS;
 
-        while curr_block_idx != NULL_BLOCK {
+        while curr_block_idx != NULL_BLOCK && blocks_left > 0 {
             let block = pool.get_block_mut(curr_block_idx);
             let sizes_ptr = block.sizes.as_ptr() as *const __m256i;
             let sizes_vec = unsafe { _mm256_loadu_si256(sizes_ptr) };
@@ -287,26 +290,21 @@ impl QueuePtrs {
                 }
             }
 
-            if curr_block_idx == self.tail_block {
+            if curr_block_idx == self.head_block {
                 break;
             }
-            curr_block_idx = block.next_block_idx;
+            curr_block_idx = block.prev_block_idx;
+            blocks_left -= 1;
         }
         false
     }
 
-    /// Scalar fallback for non-x86_64 targets. Same contract as the SIMD
-    /// version above.
-    #[cfg(not(target_arch = "x86_64"))]
-    pub unsafe fn remove_order_by_size_simd(
-        &self,
-        pool: &mut GlobalOrderPool,
-        target_size: u64,
-    ) -> bool {
-        let mut curr_block_idx = self.head_block;
-        while curr_block_idx != NULL_BLOCK {
+    fn remove_order_by_size_scalar(&self, pool: &mut GlobalOrderPool, target_size: u64) -> bool {
+        let mut curr_block_idx = self.last_nonempty_block(pool);
+        let mut blocks_left = MAX_EXACT_MATCH_BLOCKS;
+        while curr_block_idx != NULL_BLOCK && blocks_left > 0 {
             let block = pool.get_block_mut(curr_block_idx);
-            for i in 0u32..4 {
+            for i in (0u32..4).rev() {
                 if curr_block_idx == self.head_block && i < self.head_offset {
                     continue;
                 }
@@ -319,11 +317,51 @@ impl QueuePtrs {
                     return true;
                 }
             }
-            if curr_block_idx == self.tail_block {
+            if curr_block_idx == self.head_block {
                 break;
             }
-            curr_block_idx = block.next_block_idx;
+            curr_block_idx = block.prev_block_idx;
+            blocks_left -= 1;
         }
         false
+    }
+
+    #[inline(always)]
+    fn last_nonempty_block(&self, pool: &GlobalOrderPool) -> u32 {
+        if self.tail_block != self.head_block && self.tail_offset == 0 {
+            pool.get_block(self.tail_block).prev_block_idx
+        } else {
+            self.tail_block
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_removal_uses_safe_runtime_dispatch() {
+        let mut pool = GlobalOrderPool::new(4);
+        let mut queue = QueuePtrs::new(&mut pool);
+        for qty in [10, 20, 30, 40, 50] {
+            queue.push_back(&mut pool, qty);
+        }
+
+        assert!(queue.remove_order_by_size(&mut pool, 30));
+        assert!(!queue.remove_order_by_size(&mut pool, 30));
+        assert_eq!(queue.iter(&pool).collect::<Vec<_>>(), [10, 20, 40, 50]);
+    }
+
+    #[test]
+    fn exact_removal_is_bounded_to_recent_blocks() {
+        let mut pool = GlobalOrderPool::new(16);
+        let mut queue = QueuePtrs::new(&mut pool);
+        for qty in 1..=40 {
+            queue.push_back(&mut pool, qty);
+        }
+
+        assert!(!queue.remove_order_by_size(&mut pool, 1));
+        assert!(queue.remove_order_by_size(&mut pool, 40));
     }
 }

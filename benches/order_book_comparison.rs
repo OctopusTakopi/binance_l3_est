@@ -1,9 +1,10 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hint::black_box;
 
-use binance_l3_est::engine::order_book::OrderBook;
+use binance_l3_est::engine::order_book::{DepthUpdateStatus, OrderBook};
 use binance_l3_est::types::{DepthUpdate, OrderBookSnapshot, Trade};
 use binance_l3_est::utils::SymbolStr;
 use egui_plot::PlotPoint;
@@ -191,15 +192,26 @@ fn bench_comparison(c: &mut Criterion) {
     old_ob.apply_snapshot(snapshot);
 
     let mut g = c.benchmark_group("OrderBook Comparison");
-    g.bench_function("New (RingBuffer + Bitset)", |b| {
-        let mut i = 0;
+    let mut i = 0;
+    let mut next_update_id = 1001_u64;
+    g.bench_function("Full L3 estimator (RingBuffer + Bitset)", |b| {
         b.iter(|| {
-            let update = &updates[i % updates.len()];
-            let _ = new_ob.process_update(black_box(update.clone()), 1.0);
+            let mut update = updates[i % updates.len()].clone();
+            update.capital_u = next_update_id;
+            update.small_u = next_update_id;
+            update.pu = Some(next_update_id - 1);
+            let status = new_ob.process_update(black_box(update), 1.0);
+            assert_eq!(
+                status,
+                Ok(DepthUpdateStatus::Applied),
+                "next={next_update_id}, last={}",
+                new_ob.last_applied_u
+            );
             i += 1;
+            next_update_id += 1;
         })
     });
-    g.bench_function("Old (BTreeMap)", |b| {
+    g.bench_function("L2-only BTreeMap baseline", |b| {
         let mut i = 0;
         b.iter(|| {
             let update = &updates[i % updates.len()];

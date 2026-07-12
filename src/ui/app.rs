@@ -15,7 +15,7 @@ use crate::ui::windows::{
 use eframe::egui;
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender as TokioSender};
 
-// const MAX_APP_MESSAGES_PER_FRAME was removed
+const MAX_BUFFERED_DEPTH_UPDATES: usize = 100_000;
 
 // ── App struct ─────────────────────────────────────────────────────────────────
 
@@ -321,7 +321,12 @@ impl App {
 // ── eframe::App ────────────────────────────────────────────────────────────────
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.35 hands us the root `Ui` instead of a `Context`. Clone the
+        // Arc-backed context so we can keep driving input/repaints and the
+        // still-`Context`-based `Window`s while `ui` is borrowed by the panel.
+        let ctx = ui.ctx().clone();
+
         // ── 1. Periodic metrics sampling ──────────────────────────────────────
         self.metrics_timer += 1;
         // Sample every 50 frames (approx every 650ms at 75 FPS)
@@ -365,10 +370,20 @@ impl eframe::App for App {
                     }
                     self.reset_book_only();
                     self.order_book.apply_snapshot(snapshot);
+                    let mut bridge_gap = false;
                     while let Some(update) = self.update_buffer.pop_front() {
-                        let _ = self
+                        if self
                             .feature_engine
-                            .on_depth_update(update, &mut self.order_book);
+                            .on_depth_update(update, &mut self.order_book)
+                            .is_err()
+                        {
+                            bridge_gap = true;
+                            break;
+                        }
+                    }
+                    if bridge_gap {
+                        self.update_buffer.clear();
+                        let _ = self.control_tx.send(Control::Refetch);
                     }
                 }
                 AppMessage::Update { market, update } => {
@@ -379,6 +394,9 @@ impl eframe::App for App {
                         continue;
                     }
                     if self.order_book.last_applied_u == 0 {
+                        if self.update_buffer.len() == MAX_BUFFERED_DEPTH_UPDATES {
+                            self.update_buffer.pop_front();
+                        }
                         self.update_buffer.push_back(update);
                     } else {
                         let res = self
@@ -422,7 +440,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         // ── 3. Central panel ──────────────────────────────────────────────────
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(format!(
                 "{} {} Order Book",
                 self.symbol.to_uppercase(),
@@ -525,10 +543,10 @@ impl eframe::App for App {
             max_liquidity_usd: self.max_liquidity_usd,
         };
         for w in &mut self.windows {
-            w.show(ctx, &mut state);
+            w.show(&ctx, &mut state);
         }
 
-        self.show_spot_api_key_window(ctx);
-        self.show_error_popup(ctx);
+        self.show_spot_api_key_window(&ctx);
+        self.show_error_popup(&ctx);
     }
 }

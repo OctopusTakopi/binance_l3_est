@@ -44,7 +44,8 @@ pub struct OrderBook {
     pub cached_sell_points: Vec<PlotPoint>,
 
     // Liquidity Caching
-    last_liquidity_id: u64,
+    last_liquidity_curve_id: u64,
+    last_impact_book_id: u64,
     cached_buy_impact: Option<f64>,
     cached_sell_impact: Option<f64>,
     last_impact_usd: f64,
@@ -76,7 +77,8 @@ impl OrderBook {
             last_changes: Vec::with_capacity(40),
             cached_buy_points: Vec::new(),
             cached_sell_points: Vec::new(),
-            last_liquidity_id: 0,
+            last_liquidity_curve_id: 0,
+            last_impact_book_id: 0,
             cached_buy_impact: None,
             cached_sell_impact: None,
             last_impact_usd: 0.0,
@@ -117,12 +119,14 @@ impl OrderBook {
             0.0
         };
 
-        if mid > 0.0 {
+        let new_base = if mid > 0.0 {
             let mid_ticks = self.price_to_ticks(mid);
-            let new_base = mid_ticks - (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2);
-            // Fully reset on snapshot to ensure no stale levels remain
-            self.book.reset_with_base(new_base);
-        }
+            mid_ticks - (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2)
+        } else {
+            self.book.base_price_ticks
+        };
+        // Every snapshot is authoritative, including an empty one.
+        self.book.reset_with_base(new_base);
 
         self.clear_top_of_book_cache();
         self.trade_buffer.clear();
@@ -130,7 +134,8 @@ impl OrderBook {
         self.last_changes.clear();
         self.cached_buy_points.clear();
         self.cached_sell_points.clear();
-        self.last_liquidity_id = 0;
+        self.last_liquidity_curve_id = 0;
+        self.last_impact_book_id = 0;
         self.cached_buy_impact = None;
         self.cached_sell_impact = None;
         self.last_impact_usd = 0.0;
@@ -157,10 +162,7 @@ impl OrderBook {
     }
 
     pub fn reset(&mut self) {
-        self.book.slide_window(
-            self.book.base_price_ticks + (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2),
-            true,
-        );
+        self.book.reset_with_base(self.book.base_price_ticks);
         self.last_applied_u = 0;
         self.is_synced = false;
         self.trade_buffer.clear();
@@ -168,7 +170,8 @@ impl OrderBook {
         self.last_changes.clear();
         self.cached_buy_points.clear();
         self.cached_sell_points.clear();
-        self.last_liquidity_id = 0;
+        self.last_liquidity_curve_id = 0;
+        self.last_impact_book_id = 0;
         self.cached_buy_impact = None;
         self.cached_sell_impact = None;
         self.last_impact_usd = 0.0;
@@ -418,48 +421,23 @@ impl OrderBook {
         if n == 0 {
             return false;
         }
-        if is_bid {
-            // Bids rank by descending price; walk down from best_bid.
-            let mut curr = self.book.best_bid();
-            for _ in 0..n {
-                match curr {
-                    None => return true, // fewer than n bids exist
-                    Some(ticks) if ticks == price_ticks => return true,
-                    Some(ticks) if ticks < price_ticks => return true, // walked past it
-                    Some(ticks) => {
-                        let idx = self.book.get_idx(ticks).unwrap();
-                        if idx == 0 {
-                            return true;
-                        }
-                        curr = self
-                            .book
-                            .bids_bitset
-                            .find_prev(idx - 1)
-                            .map(|i| self.book.base_price_ticks + i as i64);
-                    }
-                }
-            }
-            false
+        let rel = price_ticks - self.book.base_price_ticks;
+        let bitset = if is_bid {
+            &self.book.bids_bitset
         } else {
-            // Asks rank by ascending price; walk up from best_ask.
-            let mut curr = self.book.best_ask();
-            for _ in 0..n {
-                match curr {
-                    None => return true,
-                    Some(ticks) if ticks == price_ticks => return true,
-                    Some(ticks) if ticks > price_ticks => return true,
-                    Some(ticks) => {
-                        let idx = self.book.get_idx(ticks).unwrap();
-                        curr = self
-                            .book
-                            .asks_bitset
-                            .find_next(idx + 1)
-                            .map(|i| self.book.base_price_ticks + i as i64);
-                    }
-                }
-            }
-            false
+            &self.book.asks_bitset
+        };
+
+        if rel < 0 {
+            return !is_bid || bitset.count_limited(n) < n;
         }
+        if rel >= crate::engine::fast_order_book::WINDOW_SIZE as i64 {
+            return is_bid || bitset.count_limited(n) < n;
+        }
+
+        let idx = rel as usize;
+        let outranking = self.book.count_outranking(bitset, idx, n, is_bid);
+        outranking < n
     }
 
     pub fn process_level_change(
@@ -636,16 +614,8 @@ impl OrderBook {
                 if remaining_to_remove > 0 {
                     let cancel_u64 = remaining_to_remove;
 
-                    // remove_order_by_size_simd can be used here if we want FIFO/exact match
-                    // But the original logic used pop_back if no exact match found.
-                    let mut exact_found = false;
-                    unsafe {
-                        if self.book.queues[idx]
-                            .remove_order_by_size_simd(&mut self.book.pool, remaining_to_remove)
-                        {
-                            exact_found = true;
-                        }
-                    }
+                    let exact_found = self.book.queues[idx]
+                        .remove_order_by_size(&mut self.book.pool, remaining_to_remove);
 
                     if !exact_found {
                         while remaining_to_remove > 0
@@ -735,7 +705,8 @@ impl OrderBook {
     }
 
     pub fn get_liquidity_curves(&mut self) -> (&[PlotPoint], &[PlotPoint]) {
-        if self.last_liquidity_id == self.last_applied_u && !self.cached_buy_points.is_empty() {
+        if self.last_liquidity_curve_id == self.last_applied_u && !self.cached_buy_points.is_empty()
+        {
             return (&self.cached_buy_points, &self.cached_sell_points);
         }
 
@@ -804,12 +775,12 @@ impl OrderBook {
             curr_idx = self.book.bids_bitset.find_prev(idx - 1);
         }
 
-        self.last_liquidity_id = self.last_applied_u;
+        self.last_liquidity_curve_id = self.last_applied_u;
         (&self.cached_buy_points, &self.cached_sell_points)
     }
 
     pub fn calculate_liquidity_impact(&mut self, execute_usd: f64) -> Option<(f64, f64)> {
-        if self.last_liquidity_id == self.last_applied_u
+        if self.last_impact_book_id == self.last_applied_u
             && (execute_usd - self.last_impact_usd).abs() < 1.0
             && let (Some(b), Some(s)) = (self.cached_buy_impact, self.cached_sell_impact)
         {
@@ -877,7 +848,7 @@ impl OrderBook {
         self.cached_buy_impact = buy_impact;
         self.cached_sell_impact = sell_impact;
         self.last_impact_usd = execute_usd;
-        self.last_liquidity_id = self.last_applied_u;
+        self.last_impact_book_id = self.last_applied_u;
 
         if let (Some(b), Some(s)) = (buy_impact, sell_impact) {
             Some((b, s))
@@ -1089,10 +1060,7 @@ impl OrderBook {
     }
 
     fn reset_after_gap(&mut self) {
-        self.book.slide_window(
-            self.book.base_price_ticks + (crate::engine::fast_order_book::WINDOW_SIZE as i64 / 2),
-            true,
-        );
+        self.book.reset_with_base(self.book.base_price_ticks);
         self.trade_buffer.clear();
         self.trade_expiry_queue.clear();
         self.last_changes.clear();
@@ -1186,6 +1154,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_snapshot_clears_existing_levels() {
+        let mut ob = OrderBook::new(1.0);
+        ob.apply_snapshot(OrderBookSnapshot {
+            last_update_id: 10,
+            bids: vec![[100.0, 1.0]],
+            asks: vec![[101.0, 2.0]],
+        });
+
+        ob.apply_snapshot(OrderBookSnapshot {
+            last_update_id: 11,
+            bids: vec![],
+            asks: vec![],
+        });
+
+        assert!(ob.book.best_bid().is_none());
+        assert!(ob.book.best_ask().is_none());
+    }
+
+    #[test]
+    fn top_n_rank_matches_price_priority() {
+        let mut ob = OrderBook::new(1.0);
+        ob.apply_snapshot(OrderBookSnapshot {
+            last_update_id: 10,
+            bids: (90..=100).rev().map(|price| [price as f64, 1.0]).collect(),
+            asks: (101..=111).map(|price| [price as f64, 1.0]).collect(),
+        });
+
+        assert!(ob.is_in_top_n(100, 5, true));
+        assert!(ob.is_in_top_n(96, 5, true));
+        assert!(!ob.is_in_top_n(95, 5, true));
+        assert!(ob.is_in_top_n(101, 5, false));
+        assert!(ob.is_in_top_n(105, 5, false));
+        assert!(!ob.is_in_top_n(106, 5, false));
+    }
+
+    #[test]
     fn test_process_update_inflow() {
         let mut ob = OrderBook::default();
         ob.last_applied_u = 100;
@@ -1217,6 +1221,9 @@ mod tests {
         let mut ob = OrderBook::default();
         ob.last_applied_u = 100;
         ob.is_synced = true;
+        ob.book.slide_window(ob.price_to_ticks(50_000.0), true);
+        ob.book
+            .process_update(ob.price_to_ticks(50_000.0), 1.0, true);
 
         let update = DepthUpdate {
             event_type: "depthUpdate".to_string(),
@@ -1232,6 +1239,8 @@ mod tests {
 
         let res = ob.process_update(update, 0.0);
         assert_eq!(res, Err(OrderBookError::SequenceGap));
+        assert!(ob.book.best_bid().is_none());
+        assert!(ob.book.best_ask().is_none());
     }
 
     #[test]
